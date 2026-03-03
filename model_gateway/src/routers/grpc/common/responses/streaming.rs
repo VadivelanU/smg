@@ -260,14 +260,16 @@ impl ResponseStreamEventEmitter {
         })
     }
 
+    // INVARIANT: this method is terminal — it drains internal state via `take()`
+    // and must only be called once per emitter lifetime.
     pub fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
         // Build output array from tracked items
         let output: Vec<serde_json::Value> = self
             .output_items
-            .iter()
+            .iter_mut()
             .filter_map(|item| {
                 if item.status == ItemStatus::Completed {
-                    item.item_data.clone()
+                    item.item_data.take()
                 } else {
                     None
                 }
@@ -277,12 +279,12 @@ impl ResponseStreamEventEmitter {
         // If no items were tracked (legacy path), fall back to generic message
         let output = if output.is_empty() {
             vec![json!({
-                "id": self.message_id.clone(),
+                "id": std::mem::take(&mut self.message_id),
                 "type": "message",
                 "role": "assistant",
                 "content": [{
                     "type": "output_text",
-                    "text": self.accumulated_text.clone()
+                    "text": std::mem::take(&mut self.accumulated_text)
                 }]
             })]
         } else {
@@ -663,8 +665,9 @@ impl ResponseStreamEventEmitter {
     ///
     /// This constructs the final ResponsesResponse from all accumulated output items
     /// for persistence. Should be called after streaming is complete.
+    /// Reads non-destructively so `emit_completed()` can still drain state afterwards.
     pub fn finalize(&self, usage: Option<Usage>) -> ResponsesResponse {
-        // Build output array from tracked items
+        // Build output array from tracked items (clone — emit_completed drains later)
         let output: Vec<ResponseOutputItem> = self
             .output_items
             .iter()
@@ -819,7 +822,7 @@ impl ResponseStreamEventEmitter {
                                 "role": "assistant",
                                 "content": [{
                                     "type": "output_text",
-                                    "text": self.accumulated_text.clone()
+                                    "text": std::mem::take(&mut self.accumulated_text)
                                 }]
                             });
                             let event = self.emit_output_item_done(output_index, &item);
