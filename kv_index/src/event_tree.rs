@@ -1,7 +1,7 @@
 //! Positional indexer for cache-aware routing.
 //!
-//! Uses `DashMap<(position, ContentHash), SeqEntry>` for O(1) random access to any
-//! depth position, replacing tree pointer-chasing with direct positional lookup.
+//! Uses a single `DashMap<(usize, ContentHash), SeqEntry>` keyed by (position, content_hash).
+//! No capacity limit — the map grows unboundedly as blocks are stored (matching Dynamo).
 //! Jump search skips positions in strides, yielding amortized O(D/J + W) complexity.
 //!
 //! **Dual-hash scheme**: backends send a position-aware `block_hash` (SequenceHash)
@@ -11,18 +11,35 @@
 //! precise disambiguation at query time. The backend's SequenceHash is stored in
 //! worker_blocks only, used for `apply_removed` reverse lookup.
 //!
-//! Thread safety: all methods are `&self` and internally synchronized via DashMap +
-//! parking_lot::RwLock. Reads (find_matches) and writes (apply_stored/removed/cleared)
-//! can proceed concurrently.
+//! **Performance**: Internal u32 worker IDs eliminate Arc<str> hashing and atomic
+//! refcount bouncing in the hot query loop. DashMap worker_blocks with no inner
+//! RwLock eliminates contention. Atomic tree_sizes provide O(1) size queries.
+//!
+//! Thread safety: all methods are `&self` and internally synchronized via DashMap
+//! sharding. No per-worker RwLock — worker_blocks entries are plain FxHashMaps
+//! accessed through DashMap's shard-level locking.
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use dashmap::{mapref::entry::Entry, DashMap};
-use parking_lot::RwLock;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 /// Seed for XXH3 hashing.
 pub const XXH3_SEED: u64 = 1337;
+
+/// Shard count for worker-keyed DashMaps (worker_blocks, tree_sizes, worker_to_id).
+/// Default DashMap uses num_cpus * 4 shards (e.g., 512 on 128-core machines),
+/// which wastes memory when most shards are empty. These maps hold at most ~500
+/// entries (one per worker), so 8 shards is sufficient.
+/// The index DashMap keeps the default — it's the hot path with many entries and
+/// benefits from high shard counts to avoid contention under concurrent reads+writes.
+const WORKER_SHARD_COUNT: usize = 8;
 
 /// Position-independent content hash of tokens within a single block.
 /// Computed via XXH3-64 from token IDs. Same tokens always produce the same hash
@@ -48,9 +65,10 @@ impl From<u64> for SequenceHash {
     }
 }
 
-/// Worker identifier (URL string in SMG).
-/// Uses `Arc<str>` for cheap cloning on hot paths (same pattern as `TenantId`).
-pub type WorkerId = Arc<str>;
+/// Internal worker identifier used in [`OverlapScores`].
+///
+/// Consumers map worker URLs to this type via [`PositionalIndexer::worker_id`].
+pub type WorkerId = u32;
 
 /// A block from a store event, carrying both hash representations.
 #[derive(Debug, Clone, Copy)]
@@ -82,12 +100,15 @@ impl fmt::Display for ApplyError {
 impl std::error::Error for ApplyError {}
 
 /// Overlap scores: how many consecutive blocks each worker has cached.
+///
+/// Keys are internal `u32` worker IDs. Use [`PositionalIndexer::worker_id`] to
+/// map a worker URL to its internal ID for lookups.
 #[derive(Debug, Default)]
 pub struct OverlapScores {
-    /// worker_url → number of matching prefix blocks (depth in indexer)
-    pub scores: FxHashMap<WorkerId, u32>,
-    /// worker_url → total blocks cached by this worker
-    pub tree_sizes: FxHashMap<WorkerId, usize>,
+    /// internal_worker_id → number of matching prefix blocks (depth in indexer)
+    pub scores: FxHashMap<u32, u32>,
+    /// internal_worker_id → total blocks cached by this worker
+    pub tree_sizes: FxHashMap<u32, usize>,
 }
 
 /// Compute content hash from token IDs (position-independent).
@@ -134,21 +155,20 @@ pub fn compute_request_content_hashes(tokens: &[u32], block_size: usize) -> Vec<
 #[derive(Debug, Clone)]
 enum SeqEntry {
     /// Single seq_hash → workers mapping (common case, no HashMap allocation).
-    Single(SequenceHash, FxHashSet<WorkerId>),
+    Single(SequenceHash, FxHashSet<u32>),
     /// Multiple seq_hash → workers mappings (rare: different prefixes with same content).
-    Multi(FxHashMap<SequenceHash, FxHashSet<WorkerId>>),
+    Multi(FxHashMap<SequenceHash, FxHashSet<u32>>),
 }
 
 impl SeqEntry {
-    fn new(seq_hash: SequenceHash, worker: &str) -> Self {
+    fn new(seq_hash: SequenceHash, worker_id: u32) -> Self {
         let mut workers = FxHashSet::default();
-        workers.insert(Arc::from(worker));
+        workers.insert(worker_id);
         Self::Single(seq_hash, workers)
     }
 
     /// Insert a worker for a given seq_hash, upgrading to Multi if needed.
-    fn insert(&mut self, seq_hash: SequenceHash, worker: &str) {
-        let worker_id: WorkerId = Arc::from(worker);
+    fn insert(&mut self, seq_hash: SequenceHash, worker_id: u32) {
         match self {
             Self::Single(existing_hash, workers) if *existing_hash == seq_hash => {
                 workers.insert(worker_id);
@@ -167,16 +187,16 @@ impl SeqEntry {
 
     /// Remove a worker from a given seq_hash.
     /// Returns true if the entry is now completely empty and should be removed.
-    fn remove(&mut self, seq_hash: SequenceHash, worker: &str) -> bool {
+    fn remove(&mut self, seq_hash: SequenceHash, worker_id: u32) -> bool {
         match self {
             Self::Single(existing_hash, workers) if *existing_hash == seq_hash => {
-                workers.remove(worker);
+                workers.remove(&worker_id);
                 workers.is_empty()
             }
             Self::Single(_, _) => false,
             Self::Multi(map) => {
                 if let Some(workers) = map.get_mut(&seq_hash) {
-                    workers.remove(worker);
+                    workers.remove(&worker_id);
                     if workers.is_empty() {
                         map.remove(&seq_hash);
                     }
@@ -187,11 +207,24 @@ impl SeqEntry {
     }
 
     /// Get workers for a specific prefix hash (used in query path and event processing).
-    fn get(&self, seq_hash: SequenceHash) -> Option<&FxHashSet<WorkerId>> {
+    fn get(&self, seq_hash: SequenceHash) -> Option<&FxHashSet<u32>> {
         match self {
             Self::Single(existing_hash, workers) if *existing_hash == seq_hash => Some(workers),
             Self::Single(_, _) => None,
             Self::Multi(map) => map.get(&seq_hash),
+        }
+    }
+
+    /// For Single entries, return the worker set directly without prefix hash check.
+    /// Content hash collisions at 64-bit XXH3 are practically impossible (~2^-64),
+    /// so a matching content_hash at the same position is unambiguous — the rolling
+    /// hash computation can be skipped entirely.
+    /// Returns None for Multi entries — caller must compute prefix hash to disambiguate.
+    #[inline]
+    fn workers_if_single(&self) -> Option<&FxHashSet<u32>> {
+        match self {
+            Self::Single(_, workers) => Some(workers),
+            Self::Multi(_) => None,
         }
     }
 }
@@ -202,22 +235,33 @@ impl SeqEntry {
 
 /// Per-worker reverse lookup: backend_seq_hash → (position, content_hash, prefix_hash).
 /// The `prefix_hash` is the router-computed rolling hash used as the SeqEntry key.
-type LevelIndex = RwLock<FxHashMap<SequenceHash, (usize, ContentHash, SequenceHash)>>;
+type WorkerBlockMap = FxHashMap<SequenceHash, (usize, ContentHash, SequenceHash)>;
 
 /// Positional indexer for cache-aware routing.
 ///
-/// Uses `DashMap<(position, ContentHash), SeqEntry>`
-/// for O(1) position access and jump search for O(D/J + W) matching complexity.
+/// Uses a single `DashMap<(usize, ContentHash), SeqEntry>` — keyed by
+/// (position, content_hash). Grows unboundedly (no capacity limit).
+/// Jump search gives amortized O(D/J + W) matching complexity.
 ///
-/// All methods take `&self` — concurrency is handled internally via DashMap sharding
-/// and parking_lot::RwLock.
+/// All methods take `&self` — concurrency is handled internally via DashMap sharding.
+/// No per-worker RwLock: worker_blocks entries are plain FxHashMaps accessed through
+/// DashMap's shard-level locking (matching Dynamo's zero-contention design for
+/// single-writer-per-worker workloads).
 pub struct PositionalIndexer {
-    /// Primary index: (position, content_hash) → SeqEntry.
+    /// Single flat index: (position, content_hash) → SeqEntry.
+    /// No capacity limit — grows as blocks are stored (matching Dynamo's design).
     index: DashMap<(usize, ContentHash), SeqEntry, FxBuildHasher>,
-    /// Per-worker reverse lookup: worker → { seq_hash → (position, content_hash) }.
-    /// Single RwLock because structural mutations (add/remove workers) are rare;
-    /// the hot path is read-only.
-    worker_blocks: RwLock<FxHashMap<WorkerId, LevelIndex>>,
+    /// Per-worker reverse lookup: worker_id → { seq_hash → (position, content_hash, prefix_hash) }.
+    /// DashMap shards by worker — ops on different workers never contend.
+    /// No inner RwLock: accessed via DashMap's get()/get_mut() shard locking.
+    worker_blocks: DashMap<u32, WorkerBlockMap, FxBuildHasher>,
+    /// Per-worker block counts, tracked atomically for O(1) reads during queries.
+    /// Replaces the O(worker_blocks.len()) computation with a single atomic load.
+    tree_sizes: DashMap<u32, AtomicUsize, FxBuildHasher>,
+    /// Worker URL → internal u32 ID (fast path: DashMap shard read).
+    worker_to_id: DashMap<Arc<str>, u32, FxBuildHasher>,
+    /// Monotonic counter for assigning new worker IDs.
+    next_worker_id: AtomicU32,
     /// Jump size for search optimization (default 64).
     jump_size: usize,
 }
@@ -232,9 +276,20 @@ impl PositionalIndexer {
         assert!(jump_size > 0, "jump_size must be greater than 0");
         Self {
             index: DashMap::with_hasher(FxBuildHasher),
-            worker_blocks: RwLock::new(FxHashMap::default()),
+            worker_blocks: DashMap::with_hasher_and_shard_amount(FxBuildHasher, WORKER_SHARD_COUNT),
+            tree_sizes: DashMap::with_hasher_and_shard_amount(FxBuildHasher, WORKER_SHARD_COUNT),
+            worker_to_id: DashMap::with_hasher_and_shard_amount(FxBuildHasher, WORKER_SHARD_COUNT),
+            next_worker_id: AtomicU32::new(0),
             jump_size,
         }
+    }
+
+    /// Get the internal u32 ID for a worker URL, if it has been interned.
+    ///
+    /// Used by consumers to look up scores in [`OverlapScores`] by worker URL.
+    /// Returns `None` if the worker has never been seen by this indexer.
+    pub fn worker_id(&self, worker: &str) -> Option<u32> {
+        self.worker_to_id.get(worker).map(|entry| *entry.value())
     }
 
     /// Apply a "blocks stored" event for a worker.
@@ -252,17 +307,15 @@ impl PositionalIndexer {
             return Ok(());
         }
 
-        let worker_id: WorkerId = Arc::from(worker);
+        let worker_id = self.intern_worker(worker);
 
         // Determine starting position and parent's router prefix hash.
         let (start_pos, parent_prefix) = match parent_seq_hash {
             Some(parent_hash) => {
-                let wb = self.worker_blocks.read();
-                let Some(level_index) = wb.get(&worker_id) else {
+                let Some(wb_ref) = self.worker_blocks.get(&worker_id) else {
                     return Err(ApplyError::WorkerNotTracked);
                 };
-                let worker_map = level_index.read();
-                let Some(&(parent_pos, _, parent_pfx)) = worker_map.get(&parent_hash) else {
+                let Some(&(parent_pos, _, parent_pfx)) = wb_ref.get(&parent_hash) else {
                     return Err(ApplyError::ParentBlockNotFound);
                 };
                 (parent_pos + 1, Some(parent_pfx))
@@ -270,18 +323,8 @@ impl PositionalIndexer {
             None => (0, None),
         };
 
-        if !self.worker_blocks.read().contains_key(&worker_id) {
-            self.worker_blocks
-                .write()
-                .entry(worker_id.clone())
-                .or_insert_with(|| RwLock::new(FxHashMap::default()));
-        }
-
-        let wb = self.worker_blocks.read();
-        let Some(level_index) = wb.get(&worker_id) else {
-            return Ok(());
-        };
-        let mut worker_map = level_index.write();
+        // Get-or-create worker entry and insert blocks.
+        let mut wb_ref = self.worker_blocks.entry(worker_id).or_default();
 
         let mut prev_prefix = parent_prefix;
         for (i, block) in blocks.iter().enumerate() {
@@ -298,12 +341,23 @@ impl PositionalIndexer {
 
             self.index
                 .entry((position, content_hash))
-                .and_modify(|entry| entry.insert(prefix_hash, worker))
-                .or_insert_with(|| SeqEntry::new(prefix_hash, worker));
+                .and_modify(|entry| entry.insert(prefix_hash, worker_id))
+                .or_insert_with(|| SeqEntry::new(prefix_hash, worker_id));
 
-            worker_map.insert(block.seq_hash, (position, content_hash, prefix_hash));
+            wb_ref.insert(block.seq_hash, (position, content_hash, prefix_hash));
             prev_prefix = Some(prefix_hash);
         }
+
+        drop(wb_ref);
+
+        // Atomically update tree_sizes.
+        let num_blocks = blocks.len();
+        self.tree_sizes
+            .entry(worker_id)
+            .and_modify(|size| {
+                size.fetch_add(num_blocks, Ordering::Relaxed);
+            })
+            .or_insert(AtomicUsize::new(num_blocks));
 
         Ok(())
     }
@@ -319,10 +373,9 @@ impl PositionalIndexer {
     /// when the worker is cleared or removed. Backends typically evict from the tail (LRU),
     /// so mid-sequence gaps are rare in practice.
     pub fn apply_removed(&self, worker: &str, seq_hashes: &[SequenceHash]) {
-        let worker_id: WorkerId = Arc::from(worker);
+        let worker_id = self.intern_worker(worker);
 
-        let wb = self.worker_blocks.read();
-        let Some(level_index) = wb.get(&worker_id) else {
+        let Some(mut wb_ref) = self.worker_blocks.get_mut(&worker_id) else {
             tracing::debug!(
                 worker = %worker,
                 num_hashes = seq_hashes.len(),
@@ -331,17 +384,25 @@ impl PositionalIndexer {
             return;
         };
 
-        let mut worker_map = level_index.write();
-
+        let mut num_removed = 0usize;
         for &seq_hash in seq_hashes {
-            let Some((position, content_hash, prefix_hash)) = worker_map.remove(&seq_hash) else {
+            let Some((position, content_hash, prefix_hash)) = wb_ref.remove(&seq_hash) else {
                 continue;
             };
 
             if let Entry::Occupied(mut occupied) = self.index.entry((position, content_hash)) {
-                if occupied.get_mut().remove(prefix_hash, worker) {
+                if occupied.get_mut().remove(prefix_hash, worker_id) {
                     occupied.remove();
                 }
+            }
+            num_removed += 1;
+        }
+
+        drop(wb_ref);
+
+        if num_removed > 0 {
+            if let Some(size) = self.tree_sizes.get(&worker_id) {
+                size.fetch_sub(num_removed, Ordering::Relaxed);
             }
         }
     }
@@ -358,10 +419,9 @@ impl PositionalIndexer {
 
     /// Get total number of blocks across all workers.
     pub fn current_size(&self) -> usize {
-        self.worker_blocks
-            .read()
-            .values()
-            .map(|level_index| level_index.read().len())
+        self.tree_sizes
+            .iter()
+            .map(|entry| entry.value().load(Ordering::Relaxed))
             .sum()
     }
 
@@ -371,13 +431,17 @@ impl PositionalIndexer {
     /// intermediate positions when workers drain (stop matching).
     /// Complexity: amortized O(D/J + W) where D=depth, J=jump_size, W=workers.
     ///
+    /// When `early_exit` is true, returns immediately after finding any match
+    /// at position 0 (score = 1 for all matching workers). Useful when the caller
+    /// only needs to know whether any worker has cached data for this sequence.
+    ///
     /// **Assumption**: Block sequences are prefix-closed — if a worker has a block at
     /// position N, it has blocks at all positions 0..N. This holds when backends evict
     /// from the tail (LRU). If `apply_removed` creates a mid-sequence gap, the rolling
     /// prefix hash detects it (the chain breaks at the gap), but the jump heuristic may
     /// over-count if it lands past the gap. In practice, backends only evict tail blocks.
-    pub fn find_matches(&self, content_hashes: &[ContentHash]) -> OverlapScores {
-        self.jump_search_matches(content_hashes)
+    pub fn find_matches(&self, content_hashes: &[ContentHash], early_exit: bool) -> OverlapScores {
+        self.jump_search_matches(content_hashes, early_exit)
     }
 
     // -----------------------------------------------------------------------
@@ -385,14 +449,13 @@ impl PositionalIndexer {
     // -----------------------------------------------------------------------
 
     fn remove_or_clear_worker(&self, worker: &str, keep_worker: bool) {
-        let worker_id: WorkerId = Arc::from(worker);
+        let worker_id = self.intern_worker(worker);
 
-        let mut wb = self.worker_blocks.write();
-        if let Some(level_index) = wb.remove(&worker_id) {
-            let worker_map = level_index.read();
-            for (_, &(position, content_hash, prefix_hash)) in worker_map.iter() {
+        if let Some((_, worker_map)) = self.worker_blocks.remove(&worker_id) {
+            // worker_map is owned — iterate without holding any DashMap shard lock.
+            for &(position, content_hash, prefix_hash) in worker_map.values() {
                 if let Entry::Occupied(mut occupied) = self.index.entry((position, content_hash)) {
-                    if occupied.get_mut().remove(prefix_hash, worker) {
+                    if occupied.get_mut().remove(prefix_hash, worker_id) {
                         occupied.remove();
                     }
                 }
@@ -400,7 +463,12 @@ impl PositionalIndexer {
         }
 
         if keep_worker {
-            wb.insert(worker_id, RwLock::new(FxHashMap::default()));
+            self.worker_blocks.insert(worker_id, FxHashMap::default());
+            if let Some(size) = self.tree_sizes.get(&worker_id) {
+                size.store(0, Ordering::Relaxed);
+            }
+        } else {
+            self.tree_sizes.remove(&worker_id);
         }
     }
 
@@ -442,30 +510,67 @@ impl PositionalIndexer {
         }
     }
 
-    /// Get workers at a position matching both content_hash and prefix_hash.
+    // -----------------------------------------------------------------------
+    // Internal: worker interning (u32 IDs)
+    // -----------------------------------------------------------------------
+
+    /// Intern a worker URL to an internal u32 ID.
+    /// Fast path: DashMap shard read (no lock). Slow path: DashMap entry API (once per worker).
+    fn intern_worker(&self, worker: &str) -> u32 {
+        // Fast path: already interned
+        if let Some(entry) = self.worker_to_id.get(worker) {
+            return *entry.value();
+        }
+        // Slow path: DashMap entry API handles the race — or_insert_with runs at most once.
+        *self
+            .worker_to_id
+            .entry(Arc::from(worker))
+            .or_insert_with(|| self.next_worker_id.fetch_add(1, Ordering::Relaxed))
+            .value()
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal: query helpers
+    // -----------------------------------------------------------------------
+
+    /// Get workers at a position matching content_hash (and prefix_hash for Multi).
+    /// Copies worker IDs into a Vec — used only once at position 0 to initialize `active`.
+    /// Skips rolling hash computation for Single entries (unambiguous match).
     fn get_workers_lazy(
-        &self,
+        index: &DashMap<(usize, ContentHash), SeqEntry, FxBuildHasher>,
         position: usize,
         content_hash: ContentHash,
         seq_hashes: &mut Vec<SequenceHash>,
         sequence: &[ContentHash],
-    ) -> Option<FxHashSet<WorkerId>> {
-        let entry = self.index.get(&(position, content_hash))?;
+    ) -> Option<Vec<u32>> {
+        let entry = index.get(&(position, content_hash))?;
+        if let Some(workers) = entry.value().workers_if_single() {
+            return Some(workers.iter().copied().collect());
+        }
+        // Multi: need rolling hash to disambiguate
         Self::ensure_seq_hash_computed(seq_hashes, position, sequence);
-        entry.get(seq_hashes[position]).cloned()
+        entry
+            .value()
+            .get(seq_hashes[position])
+            .map(|workers| workers.iter().copied().collect())
     }
 
-    /// Count workers at a position matching the prefix_hash.
+    /// Count workers at a position matching the prefix_hash (no set materialization).
+    /// Skips rolling hash computation for Single entries (unambiguous match).
     fn count_workers_at(
-        &self,
+        index: &DashMap<(usize, ContentHash), SeqEntry, FxBuildHasher>,
         position: usize,
         content_hash: ContentHash,
         seq_hashes: &mut Vec<SequenceHash>,
         sequence: &[ContentHash],
     ) -> usize {
-        let Some(entry) = self.index.get(&(position, content_hash)) else {
+        let Some(entry) = index.get(&(position, content_hash)) else {
             return 0;
         };
+        if let Some(workers) = entry.value().workers_if_single() {
+            return workers.len();
+        }
+        // Multi: need rolling hash to disambiguate
         Self::ensure_seq_hash_computed(seq_hashes, position, sequence);
         entry
             .get(seq_hashes[position])
@@ -473,15 +578,21 @@ impl PositionalIndexer {
             .unwrap_or(0)
     }
 
-    /// Scan positions sequentially, filtering by prefix_hash.
+    /// Scan positions sequentially, draining workers that stop matching.
+    /// Accesses DashMap entries directly — no set cloning.
+    /// Skips rolling hash computation for Single entries (unambiguous match).
+    /// Uses Dynamo's retain guard: skips retain when workers.len() >= active.len()
+    /// (all active workers are still present, no work to do).
+    #[expect(clippy::too_many_arguments)]
     fn linear_scan_drain(
-        &self,
+        index: &DashMap<(usize, ContentHash), SeqEntry, FxBuildHasher>,
         sequence: &[ContentHash],
         seq_hashes: &mut Vec<SequenceHash>,
-        active: &mut FxHashSet<WorkerId>,
-        scores: &mut OverlapScores,
+        active: &mut Vec<u32>,
+        internal_scores: &mut FxHashMap<u32, u32>,
         lo: usize,
         hi: usize,
+        early_exit: bool,
     ) {
         for (offset, &content_hash) in sequence[lo..hi].iter().enumerate() {
             if active.is_empty() {
@@ -489,30 +600,72 @@ impl PositionalIndexer {
             }
             let pos = lo + offset;
 
-            let workers = self.index.get(&(pos, content_hash)).and_then(|entry| {
-                Self::ensure_seq_hash_computed(seq_hashes, pos, sequence);
-                entry.get(seq_hashes[pos]).cloned()
-            });
-
-            let Some(workers) = workers else {
-                for worker in active.drain() {
-                    scores.scores.insert(worker, pos as u32);
+            let Some(entry) = index.get(&(pos, content_hash)) else {
+                for &w in active.iter() {
+                    internal_scores.insert(w, pos as u32);
                 }
+                active.clear();
                 break;
             };
 
-            active.retain(|w| {
-                if workers.contains(w) {
-                    true
-                } else {
-                    scores.scores.insert(w.clone(), pos as u32);
-                    false
+            // Fast path: Single entry — skip rolling hash, use workers directly.
+            if let Some(workers) = entry.value().workers_if_single() {
+                // Retain guard (Dynamo optimization): only retain when some workers
+                // have dropped off. When workers.len() >= active.len(), all active
+                // workers are still present — skip the O(active) iteration.
+                if workers.len() < active.len() {
+                    let mut i = 0;
+                    while i < active.len() {
+                        if workers.contains(&active[i]) {
+                            i += 1;
+                        } else {
+                            internal_scores.insert(active[i], pos as u32);
+                            active.swap_remove(i);
+                        }
+                    }
                 }
-            });
+                if early_exit && !active.is_empty() {
+                    break;
+                }
+                continue;
+            }
+
+            // Multi: need rolling hash to disambiguate.
+            Self::ensure_seq_hash_computed(seq_hashes, pos, sequence);
+            let seq_hash = seq_hashes[pos];
+
+            let Some(workers) = entry.get(seq_hash) else {
+                for &w in active.iter() {
+                    internal_scores.insert(w, pos as u32);
+                }
+                active.clear();
+                break;
+            };
+
+            // Retain guard: only iterate when some workers dropped off.
+            if workers.len() < active.len() {
+                let mut i = 0;
+                while i < active.len() {
+                    if workers.contains(&active[i]) {
+                        i += 1;
+                    } else {
+                        internal_scores.insert(active[i], pos as u32);
+                        active.swap_remove(i);
+                    }
+                }
+            }
+
+            if early_exit && !active.is_empty() {
+                break;
+            }
         }
     }
 
-    fn jump_search_matches(&self, content_hashes: &[ContentHash]) -> OverlapScores {
+    fn jump_search_matches(
+        &self,
+        content_hashes: &[ContentHash],
+        early_exit: bool,
+    ) -> OverlapScores {
         let mut scores = OverlapScores::default();
 
         if content_hashes.is_empty() {
@@ -521,9 +674,13 @@ impl PositionalIndexer {
 
         let mut seq_hashes = Vec::with_capacity(content_hashes.len());
 
-        let Some(initial_workers) =
-            self.get_workers_lazy(0, content_hashes[0], &mut seq_hashes, content_hashes)
-        else {
+        let Some(initial_workers) = Self::get_workers_lazy(
+            &self.index,
+            0,
+            content_hashes[0],
+            &mut seq_hashes,
+            content_hashes,
+        ) else {
             return scores;
         };
 
@@ -533,12 +690,31 @@ impl PositionalIndexer {
         }
 
         let len = content_hashes.len();
+        let mut internal_scores: FxHashMap<u32, u32> = FxHashMap::default();
+
+        // Early exit: just record that workers matched at position 0.
+        if early_exit {
+            for &w in &active {
+                internal_scores.insert(w, 1);
+            }
+            scores.scores = internal_scores;
+            for &int_id in scores.scores.keys() {
+                if let Some(size) = self.tree_sizes.get(&int_id) {
+                    scores
+                        .tree_sizes
+                        .insert(int_id, size.load(Ordering::Relaxed));
+                }
+            }
+            return scores;
+        }
+
         let mut current_pos = 0;
 
         while current_pos < len - 1 && !active.is_empty() {
             let next_pos = (current_pos + self.jump_size).min(len - 1);
 
-            let count = self.count_workers_at(
+            let count = Self::count_workers_at(
+                &self.index,
                 next_pos,
                 content_hashes[next_pos],
                 &mut seq_hashes,
@@ -550,29 +726,33 @@ impl PositionalIndexer {
             if count == active.len() {
                 current_pos = next_pos;
             } else {
-                self.linear_scan_drain(
+                Self::linear_scan_drain(
+                    &self.index,
                     content_hashes,
                     &mut seq_hashes,
                     &mut active,
-                    &mut scores,
+                    &mut internal_scores,
                     current_pos + 1,
                     next_pos + 1,
+                    false,
                 );
                 current_pos = next_pos;
             }
         }
 
         let final_score = len as u32;
-        for worker in active {
-            scores.scores.insert(worker, final_score);
+        for &w in &active {
+            internal_scores.insert(w, final_score);
         }
 
-        let wb = self.worker_blocks.read();
-        for worker in scores.scores.keys() {
-            if let Some(level_index) = wb.get(worker) {
+        scores.scores = internal_scores;
+
+        // Populate tree_sizes from atomic counters — O(1) per worker, no locks.
+        for &int_id in scores.scores.keys() {
+            if let Some(size) = self.tree_sizes.get(&int_id) {
                 scores
                     .tree_sizes
-                    .insert(Arc::clone(worker), level_index.read().len());
+                    .insert(int_id, size.load(Ordering::Relaxed));
             }
         }
 
@@ -582,19 +762,16 @@ impl PositionalIndexer {
 
 impl Default for PositionalIndexer {
     fn default() -> Self {
-        Self::new(64)
+        Self::new(32)
     }
 }
 
 impl fmt::Debug for PositionalIndexer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PositionalIndexer")
-            .field("index_size", &self.index.len())
+            .field("entries", &self.index.len())
             .field("jump_size", &self.jump_size)
-            .field(
-                "workers",
-                &self.worker_blocks.read().keys().collect::<Vec<_>>(),
-            )
+            .field("workers", &self.worker_blocks.len())
             .finish()
     }
 }
@@ -631,7 +808,7 @@ mod tests {
     #[test]
     fn test_new_indexer_is_empty() {
         let indexer = PositionalIndexer::default();
-        let scores = indexer.find_matches(&hashes(&[1, 2, 3]));
+        let scores = indexer.find_matches(&hashes(&[1, 2, 3]), false);
         assert!(scores.scores.is_empty());
         assert_eq!(indexer.current_size(), 0);
     }
@@ -644,9 +821,10 @@ mod tests {
             .apply_stored("http://w1:8000", &blocks, None)
             .unwrap();
 
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&3));
-        assert_eq!(scores.tree_sizes.get("http://w1:8000"), Some(&3));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&3));
+        assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
     }
 
     #[test]
@@ -657,9 +835,10 @@ mod tests {
             .apply_stored("http://w1:8000", &blocks, None)
             .unwrap();
 
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
         // Request has longer sequence — only first 3 match
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30, 40, 50]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&3));
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30, 40, 50]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&3));
     }
 
     #[test]
@@ -670,7 +849,7 @@ mod tests {
             .apply_stored("http://w1:8000", &blocks, None)
             .unwrap();
 
-        let scores = indexer.find_matches(&hashes(&[99, 88, 77]));
+        let scores = indexer.find_matches(&hashes(&[99, 88, 77]), false);
         assert!(scores.scores.is_empty());
     }
 
@@ -686,9 +865,11 @@ mod tests {
             .apply_stored("http://w2:8000", &blocks_w2, None)
             .unwrap();
 
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30, 40]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&3));
-        assert_eq!(scores.scores.get("http://w2:8000"), Some(&2));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let w2 = indexer.worker_id("http://w2:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30, 40]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&3));
+        assert_eq!(scores.scores.get(&w2), Some(&2));
     }
 
     #[test]
@@ -701,10 +882,11 @@ mod tests {
             .unwrap();
         indexer.apply_removed("http://w1:8000", &[seq_hash_of_30]);
 
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
         // After removing block at position 2, w1 should only match 2 blocks
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&2));
-        assert_eq!(scores.tree_sizes.get("http://w1:8000"), Some(&2));
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&2));
+        assert_eq!(scores.tree_sizes.get(&w1), Some(&2));
     }
 
     #[test]
@@ -721,9 +903,11 @@ mod tests {
 
         indexer.apply_cleared("http://w1:8000");
 
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]));
-        assert!(!scores.scores.contains_key("http://w1:8000"));
-        assert_eq!(scores.scores.get("http://w2:8000"), Some(&2));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let w2 = indexer.worker_id("http://w2:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
+        assert!(!scores.scores.contains_key(&w1));
+        assert_eq!(scores.scores.get(&w2), Some(&2));
     }
 
     #[test]
@@ -738,9 +922,11 @@ mod tests {
             .apply_stored("http://w2:8000", &blocks_w2, None)
             .unwrap();
 
-        let scores = indexer.find_matches(&hashes(&[10]));
-        assert_eq!(scores.tree_sizes.get("http://w1:8000"), Some(&3));
-        assert_eq!(scores.tree_sizes.get("http://w2:8000"), Some(&2));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let w2 = indexer.worker_id("http://w2:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&[10]), false);
+        assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
+        assert_eq!(scores.tree_sizes.get(&w2), Some(&2));
     }
 
     #[test]
@@ -753,456 +939,363 @@ mod tests {
             .apply_stored("http://w1:8000", &blocks1, None)
             .unwrap();
 
-        // Second store: blocks at positions 2, 3 (extending from parent at position 1)
-        // Need seq_hashes that chain from blocks1's last seq_hash
-        let ch_30 = 30u64;
-        let ch_40 = 40u64;
-        let seq_30 = PositionalIndexer::compute_next_seq_hash(parent_seq_hash.0, ch_30);
-        let seq_40 = PositionalIndexer::compute_next_seq_hash(seq_30, ch_40);
+        // Second store: blocks at positions 2, 3 (extending from parent)
         let blocks2 = vec![
             StoredBlock {
-                seq_hash: SequenceHash(seq_30),
-                content_hash: ContentHash(ch_30),
+                seq_hash: SequenceHash(300),
+                content_hash: ContentHash(30),
             },
             StoredBlock {
-                seq_hash: SequenceHash(seq_40),
-                content_hash: ContentHash(ch_40),
+                seq_hash: SequenceHash(400),
+                content_hash: ContentHash(40),
             },
         ];
         indexer
             .apply_stored("http://w1:8000", &blocks2, Some(parent_seq_hash))
             .unwrap();
 
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30, 40]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&4));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30, 40]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&4));
+        assert_eq!(scores.tree_sizes.get(&w1), Some(&4));
     }
 
     #[test]
-    fn test_remove_nonexistent_worker() {
+    fn test_store_with_parent_error_worker_not_tracked() {
         let indexer = PositionalIndexer::new(64);
         let blocks = make_blocks(&[10, 20]);
+        let result = indexer.apply_stored("http://w1:8000", &blocks, Some(SequenceHash(999)));
+        assert!(matches!(result, Err(ApplyError::WorkerNotTracked)));
+    }
+
+    #[test]
+    fn test_store_with_parent_error_parent_not_found() {
+        let indexer = PositionalIndexer::new(64);
+        let blocks1 = make_blocks(&[10, 20]);
+        indexer
+            .apply_stored("http://w1:8000", &blocks1, None)
+            .unwrap();
+
+        let blocks2 = make_blocks(&[30]);
+        let result = indexer.apply_stored("http://w1:8000", &blocks2, Some(SequenceHash(999_999)));
+        assert!(matches!(result, Err(ApplyError::ParentBlockNotFound)));
+    }
+
+    #[test]
+    fn test_remove_missing_block_is_noop() {
+        let indexer = PositionalIndexer::new(64);
+        let blocks = make_blocks(&[10, 20, 30]);
         indexer
             .apply_stored("http://w1:8000", &blocks, None)
             .unwrap();
 
-        // Removing blocks for a worker that doesn't own them is a no-op
-        indexer.apply_removed("http://w2:8000", &[SequenceHash(999)]);
-
-        let scores = indexer.find_matches(&hashes(&[10, 20]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&2));
+        indexer.apply_removed("http://w1:8000", &[SequenceHash(999)]);
+        assert_eq!(indexer.current_size(), 3);
     }
 
     #[test]
-    fn test_jump_search_skips_positions() {
-        // Use a small jump_size to test the jump behavior
+    fn test_remove_unknown_worker_is_noop() {
+        let indexer = PositionalIndexer::new(64);
+        indexer.apply_removed("http://unknown:8000", &[SequenceHash(1)]);
+    }
+
+    #[test]
+    fn test_remove_worker() {
+        let indexer = PositionalIndexer::new(64);
+        let blocks = make_blocks(&[10, 20, 30]);
+        indexer
+            .apply_stored("http://w1:8000", &blocks, None)
+            .unwrap();
+        indexer.remove_worker("http://w1:8000");
+
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
+        assert!(scores.scores.is_empty());
+        assert_eq!(indexer.current_size(), 0);
+    }
+
+    #[test]
+    fn test_multiple_workers_same_position() {
+        let indexer = PositionalIndexer::new(64);
+        indexer
+            .apply_stored("http://w1:8000", &make_blocks(&[10]), None)
+            .unwrap();
+        indexer
+            .apply_stored("http://w2:8000", &make_blocks(&[10]), None)
+            .unwrap();
+        indexer
+            .apply_stored("http://w3:8000", &make_blocks(&[10]), None)
+            .unwrap();
+
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let w2 = indexer.worker_id("http://w2:8000").unwrap();
+        let w3 = indexer.worker_id("http://w3:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&[10]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&1));
+        assert_eq!(scores.scores.get(&w2), Some(&1));
+        assert_eq!(scores.scores.get(&w3), Some(&1));
+    }
+
+    #[test]
+    fn test_empty_blocks_is_noop() {
+        let indexer = PositionalIndexer::new(64);
+        indexer.apply_stored("http://w1:8000", &[], None).unwrap();
+        assert_eq!(indexer.current_size(), 0);
+    }
+
+    #[test]
+    fn test_single_block_sequence() {
+        let indexer = PositionalIndexer::new(64);
+        let blocks = make_blocks(&[42]);
+        indexer
+            .apply_stored("http://w1:8000", &blocks, None)
+            .unwrap();
+
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&[42]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&1));
+    }
+
+    #[test]
+    fn test_request_content_hash_chunking() {
+        let hashes = compute_request_content_hashes(&[1, 2, 3, 4, 5, 6, 7, 8], 4);
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes[0], compute_content_hash(&[1, 2, 3, 4]));
+        assert_eq!(hashes[1], compute_content_hash(&[5, 6, 7, 8]));
+    }
+
+    #[test]
+    fn test_request_content_hash_zero_block_size() {
+        let hashes = compute_request_content_hashes(&[1, 2, 3], 0);
+        assert!(hashes.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Jump search edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_jump_search_long_prefix() {
+        let indexer = PositionalIndexer::new(4); // small jump_size to exercise jump logic
+        let values: Vec<u64> = (1..=20).collect();
+        let blocks = make_blocks(&values);
+        indexer
+            .apply_stored("http://w1:8000", &blocks, None)
+            .unwrap();
+
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&values), false);
+        assert_eq!(scores.scores.get(&w1), Some(&20));
+    }
+
+    #[test]
+    fn test_jump_search_worker_drains_mid_jump() {
         let indexer = PositionalIndexer::new(4);
-
-        // Worker 1: 10 blocks
-        let content: Vec<u64> = (100..110).collect();
-        let blocks_w1 = make_blocks(&content);
+        // w1 has 10 blocks, w2 has 6
+        let values_w1: Vec<u64> = (1..=10).collect();
+        let values_w2: Vec<u64> = (1..=6).collect();
         indexer
-            .apply_stored("http://w1:8000", &blocks_w1, None)
+            .apply_stored("http://w1:8000", &make_blocks(&values_w1), None)
+            .unwrap();
+        indexer
+            .apply_stored("http://w2:8000", &make_blocks(&values_w2), None)
             .unwrap();
 
-        // Worker 2: only first 6 blocks
-        let blocks_w2 = make_blocks(&content[..6]);
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let w2 = indexer.worker_id("http://w2:8000").unwrap();
+        let query: Vec<u64> = (1..=10).collect();
+        let scores = indexer.find_matches(&hashes(&query), false);
+        assert_eq!(scores.scores.get(&w1), Some(&10));
+        assert_eq!(scores.scores.get(&w2), Some(&6));
+    }
+
+    #[test]
+    fn test_jump_search_multiple_drains() {
+        let indexer = PositionalIndexer::new(3);
+        // w1: 12, w2: 7, w3: 4
+        let v1: Vec<u64> = (1..=12).collect();
+        let v2: Vec<u64> = (1..=7).collect();
+        let v3: Vec<u64> = (1..=4).collect();
         indexer
-            .apply_stored("http://w2:8000", &blocks_w2, None)
+            .apply_stored("http://w1:8000", &make_blocks(&v1), None)
+            .unwrap();
+        indexer
+            .apply_stored("http://w2:8000", &make_blocks(&v2), None)
+            .unwrap();
+        indexer
+            .apply_stored("http://w3:8000", &make_blocks(&v3), None)
             .unwrap();
 
-        let scores = indexer.find_matches(&hashes(&content));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&10));
-        assert_eq!(scores.scores.get("http://w2:8000"), Some(&6));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let w2 = indexer.worker_id("http://w2:8000").unwrap();
+        let w3 = indexer.worker_id("http://w3:8000").unwrap();
+        let query: Vec<u64> = (1..=12).collect();
+        let scores = indexer.find_matches(&hashes(&query), false);
+        assert_eq!(scores.scores.get(&w1), Some(&12));
+        assert_eq!(scores.scores.get(&w2), Some(&7));
+        assert_eq!(scores.scores.get(&w3), Some(&4));
+    }
+
+    #[test]
+    fn test_concurrent_store_and_match() {
+        use std::{sync::Arc, thread};
+
+        let indexer = Arc::new(PositionalIndexer::new(64));
+        let indexer_writer = Arc::clone(&indexer);
+
+        let writer = thread::spawn(move || {
+            for i in 0..100u64 {
+                let blocks = make_blocks(&[i * 10, i * 10 + 1, i * 10 + 2]);
+                let _ = indexer_writer.apply_stored(&format!("http://w{i}:8000"), &blocks, None);
+            }
+        });
+
+        let reader = thread::spawn({
+            let indexer = Arc::clone(&indexer);
+            move || {
+                for _ in 0..1000 {
+                    let _ = indexer.find_matches(&hashes(&[0, 1, 2, 3, 4]), false);
+                }
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
     }
 
     #[test]
     fn test_seq_entry_single_to_multi_upgrade() {
         let indexer = PositionalIndexer::new(64);
 
-        // Two workers with DIFFERENT content at position 0 but SAME content at position 1.
-        // This creates different router prefix hashes at position 1, triggering Multi upgrade.
-        // W1: content [10, 20] → prefix [10, hash(10||20)]
-        // W2: content [99, 20] → prefix [99, hash(99||20)]
-        // At position 1, both have ContentHash(20) but different prefix hashes → Multi.
-        let blocks_w1 = vec![
-            StoredBlock {
-                seq_hash: SequenceHash(1000),
-                content_hash: ContentHash(10),
-            },
-            StoredBlock {
-                seq_hash: SequenceHash(2000),
-                content_hash: ContentHash(20),
-            },
-        ];
-        let blocks_w2 = vec![
-            StoredBlock {
-                seq_hash: SequenceHash(3000),
-                content_hash: ContentHash(99),
-            },
-            StoredBlock {
-                seq_hash: SequenceHash(4000),
-                content_hash: ContentHash(20),
-            },
-        ];
-
+        // Two workers with same content hashes but different rolling prefixes
+        // Worker 1: blocks at position 0 with content_hash=10
+        let blocks_w1 = vec![StoredBlock {
+            seq_hash: SequenceHash(100),
+            content_hash: ContentHash(10),
+        }];
         indexer
             .apply_stored("http://w1:8000", &blocks_w1, None)
             .unwrap();
+
+        // Worker 2: same content_hash but different seq_hash
+        // Both start at position 0, so prefix_hash == content_hash.0 for both
+        // This means they share the same prefix_hash → Single entry, both workers in set
+        let blocks_w2 = vec![StoredBlock {
+            seq_hash: SequenceHash(200),
+            content_hash: ContentHash(10),
+        }];
         indexer
             .apply_stored("http://w2:8000", &blocks_w2, None)
             .unwrap();
 
-        // Position 1 has same content but different prefix histories → Multi
-        {
-            let entry = indexer.index.get(&(1, ContentHash(20))).unwrap();
-            assert!(matches!(entry.value(), SeqEntry::Multi(_)));
-        }
-
-        // Same content at same position → Single (both share prefix hash)
-        // Workers with identical content get identical router prefix hashes.
-        let indexer2 = PositionalIndexer::new(64);
-        let blocks_w3 = make_blocks(&[10, 20]);
-        let blocks_w4 = vec![
-            StoredBlock {
-                seq_hash: SequenceHash(5000),
-                content_hash: ContentHash(10),
-            },
-            StoredBlock {
-                seq_hash: SequenceHash(6000),
-                content_hash: ContentHash(20),
-            },
-        ];
-        indexer2
-            .apply_stored("http://w3:8000", &blocks_w3, None)
-            .unwrap();
-        indexer2
-            .apply_stored("http://w4:8000", &blocks_w4, None)
-            .unwrap();
-        {
-            let entry = indexer2.index.get(&(0, ContentHash(10))).unwrap();
-            assert!(matches!(entry.value(), SeqEntry::Single(_, _)));
-        }
-
-        // Query: [10, 20] matches only w1 (w2 has content 99 at position 0)
-        let scores = indexer.find_matches(&hashes(&[10, 20]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&2));
-        assert!(!scores.scores.contains_key("http://w2:8000"));
-
-        // Remove w1 via backend seq_hashes — reverse lookup maps to correct prefix hash
-        indexer.apply_removed("http://w1:8000", &[SequenceHash(1000), SequenceHash(2000)]);
-        let scores2 = indexer.find_matches(&hashes(&[10, 20]));
-        assert!(!scores2.scores.contains_key("http://w1:8000"));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let w2 = indexer.worker_id("http://w2:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&[10]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&1));
+        assert_eq!(scores.scores.get(&w2), Some(&1));
     }
 
     #[test]
-    fn test_concurrent_find_matches() {
-        let indexer = Arc::new(PositionalIndexer::new(64));
-        let blocks = make_blocks(&[10, 20, 30]);
+    fn test_seq_entry_distinct_prefix_same_content() {
+        let indexer = PositionalIndexer::new(64);
+
+        // Worker 1: position 0 = content 10, position 1 = content 99
+        // Prefix at pos 1 = XXH3(10 || 99)
+        let blocks_w1 = make_blocks(&[10, 99]);
         indexer
-            .apply_stored("http://w1:8000", &blocks, None)
+            .apply_stored("http://w1:8000", &blocks_w1, None)
             .unwrap();
 
-        let mut handles = Vec::new();
-        for _ in 0..8 {
-            let indexer = Arc::clone(&indexer);
-            handles.push(std::thread::spawn(move || {
-                let scores = indexer.find_matches(&hashes(&[10, 20, 30]));
-                assert_eq!(scores.scores.get("http://w1:8000"), Some(&3));
-            }));
-        }
+        // Worker 2: position 0 = content 20, position 1 = content 99
+        // Prefix at pos 1 = XXH3(20 || 99) ← different because position 0 differs
+        let blocks_w2 = make_blocks(&[20, 99]);
+        indexer
+            .apply_stored("http://w2:8000", &blocks_w2, None)
+            .unwrap();
 
-        for handle in handles {
-            handle.join().unwrap();
-        }
+        // Query [10, 99] should only match w1
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&[10, 99]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&2));
+        // w2 has a different prefix at position 0, so it won't be in initial active set
+
+        // Query [20, 99] should only match w2
+        let w2 = indexer.worker_id("http://w2:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&[20, 99]), false);
+        assert_eq!(scores.scores.get(&w2), Some(&2));
     }
 
-    #[test]
-    fn test_compute_content_hash_different_tokens() {
-        let hash1 = compute_content_hash(&[1, 2, 3, 4]);
-        let hash2 = compute_content_hash(&[5, 6, 7, 8]);
-        assert_ne!(hash1, hash2);
-    }
+    // -----------------------------------------------------------------------
+    // early_exit tests
+    // -----------------------------------------------------------------------
 
     #[test]
-    fn test_remove_worker_entirely() {
+    fn test_early_exit_returns_score_one() {
         let indexer = PositionalIndexer::new(64);
         let blocks = make_blocks(&[10, 20, 30]);
         indexer
             .apply_stored("http://w1:8000", &blocks, None)
             .unwrap();
 
-        indexer.remove_worker("http://w1:8000");
-
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]));
-        assert!(scores.scores.is_empty());
-        assert_eq!(indexer.current_size(), 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // Additional comprehensive tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_empty_store_is_noop() {
-        let indexer = PositionalIndexer::default();
-        indexer.apply_stored("http://w1:8000", &[], None).unwrap();
-        assert_eq!(indexer.current_size(), 0);
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), true);
+        // early_exit: score is 1 (matched at position 0), not full depth
+        assert_eq!(scores.scores.get(&w1), Some(&1));
+        // tree_sizes still populated
+        assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
     }
 
     #[test]
-    fn test_find_matches_empty_query() {
-        let indexer = PositionalIndexer::default();
-        let blocks = make_blocks(&[10, 20]);
-        indexer
-            .apply_stored("http://w1:8000", &blocks, None)
-            .unwrap();
-
-        let scores = indexer.find_matches(&[]);
-        assert!(scores.scores.is_empty());
-    }
-
-    #[test]
-    fn test_store_with_parent_not_found() {
-        let indexer = PositionalIndexer::default();
-        let blocks = make_blocks(&[10, 20]);
-        indexer
-            .apply_stored("http://w1:8000", &blocks, None)
-            .unwrap();
-
-        // Try to extend from a non-existent parent — should return ParentBlockNotFound
-        let orphan_blocks = make_blocks(&[30, 40]);
-        let err = indexer
-            .apply_stored("http://w1:8000", &orphan_blocks, Some(SequenceHash(999999)))
-            .unwrap_err();
-        assert!(matches!(err, ApplyError::ParentBlockNotFound));
-
-        // Should still only have the original 2 blocks
-        assert_eq!(indexer.current_size(), 2);
-    }
-
-    #[test]
-    fn test_store_with_parent_untracked_worker() {
-        let indexer = PositionalIndexer::default();
-        let orphan_blocks = make_blocks(&[10, 20]);
-
-        // Worker not tracked — should return WorkerNotTracked
-        let err = indexer
-            .apply_stored("http://new:8000", &orphan_blocks, Some(SequenceHash(123)))
-            .unwrap_err();
-        assert!(matches!(err, ApplyError::WorkerNotTracked));
-        assert_eq!(indexer.current_size(), 0);
-    }
-
-    #[test]
-    fn test_double_remove_same_block() {
-        let indexer = PositionalIndexer::default();
-        let blocks = make_blocks(&[10, 20, 30]);
-        let seq_hash_30 = blocks[2].seq_hash;
-        indexer
-            .apply_stored("http://w1:8000", &blocks, None)
-            .unwrap();
-
-        indexer.apply_removed("http://w1:8000", &[seq_hash_30]);
-        // Second remove should be a no-op (already gone)
-        indexer.apply_removed("http://w1:8000", &[seq_hash_30]);
-
-        assert_eq!(indexer.current_size(), 2);
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&2));
-    }
-
-    #[test]
-    fn test_store_after_clear() {
-        let indexer = PositionalIndexer::default();
-        let blocks = make_blocks(&[10, 20, 30]);
-        indexer
-            .apply_stored("http://w1:8000", &blocks, None)
-            .unwrap();
-
-        indexer.apply_cleared("http://w1:8000");
-        assert_eq!(indexer.current_size(), 0);
-
-        // Re-store after clear
-        let new_blocks = make_blocks(&[40, 50]);
-        indexer
-            .apply_stored("http://w1:8000", &new_blocks, None)
-            .unwrap();
-
-        assert_eq!(indexer.current_size(), 2);
-        let scores = indexer.find_matches(&hashes(&[40, 50]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&2));
-    }
-
-    #[test]
-    fn test_store_after_remove_worker() {
-        let indexer = PositionalIndexer::default();
-        let blocks = make_blocks(&[10, 20]);
-        indexer
-            .apply_stored("http://w1:8000", &blocks, None)
-            .unwrap();
-
-        indexer.remove_worker("http://w1:8000");
-        assert_eq!(indexer.current_size(), 0);
-
-        // Re-store after full removal
-        let new_blocks = make_blocks(&[30, 40]);
-        indexer
-            .apply_stored("http://w1:8000", &new_blocks, None)
-            .unwrap();
-
-        assert_eq!(indexer.current_size(), 2);
-        let scores = indexer.find_matches(&hashes(&[30, 40]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&2));
-    }
-
-    #[test]
-    fn test_overlapping_stores_same_worker() {
-        // Worker stores [10, 20, 30], then stores again [10, 20] — positions overlap
-        let indexer = PositionalIndexer::default();
-        let blocks1 = make_blocks(&[10, 20, 30]);
-        indexer
-            .apply_stored("http://w1:8000", &blocks1, None)
-            .unwrap();
-
-        // Re-store shorter prefix — adds duplicate entries at same positions
-        let blocks2 = make_blocks(&[10, 20]);
-        indexer
-            .apply_stored("http://w1:8000", &blocks2, None)
-            .unwrap();
-
-        // Should still match the full depth (3 blocks from first store)
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&3));
-    }
-
-    #[test]
-    fn test_many_workers_same_prefix() {
-        let indexer = PositionalIndexer::default();
-        let blocks = make_blocks(&[10, 20, 30]);
-
-        for i in 0..10 {
-            let worker = format!("http://w{i}:8000");
-            indexer.apply_stored(&worker, &blocks, None).unwrap();
-        }
-
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]));
-        assert_eq!(scores.scores.len(), 10);
-        for i in 0..10 {
-            let worker = format!("http://w{i}:8000");
-            assert_eq!(scores.scores.get(worker.as_str()), Some(&3));
-        }
-    }
-
-    #[test]
-    fn test_jump_search_with_jump_size_1() {
-        // jump_size=1 means linear scan every step (degenerate case)
-        let indexer = PositionalIndexer::new(1);
-        let content: Vec<u64> = (100..120).collect();
-        let blocks_w1 = make_blocks(&content);
-        let blocks_w2 = make_blocks(&content[..10]);
-        indexer
-            .apply_stored("http://w1:8000", &blocks_w1, None)
-            .unwrap();
-        indexer
-            .apply_stored("http://w2:8000", &blocks_w2, None)
-            .unwrap();
-
-        let scores = indexer.find_matches(&hashes(&content));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&20));
-        assert_eq!(scores.scores.get("http://w2:8000"), Some(&10));
-    }
-
-    #[test]
-    fn test_jump_search_workers_drain_at_different_positions() {
-        // 3 workers with different depths, small jump_size to exercise linear_scan_drain
-        let indexer = PositionalIndexer::new(3);
-        let content: Vec<u64> = (1..=15).collect();
-
-        let blocks_w1 = make_blocks(&content); // 15 blocks
-        let blocks_w2 = make_blocks(&content[..7]); // 7 blocks
-        let blocks_w3 = make_blocks(&content[..4]); // 4 blocks
-
-        indexer
-            .apply_stored("http://w1:8000", &blocks_w1, None)
-            .unwrap();
-        indexer
-            .apply_stored("http://w2:8000", &blocks_w2, None)
-            .unwrap();
-        indexer
-            .apply_stored("http://w3:8000", &blocks_w3, None)
-            .unwrap();
-
-        let scores = indexer.find_matches(&hashes(&content));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&15));
-        assert_eq!(scores.scores.get("http://w2:8000"), Some(&7));
-        assert_eq!(scores.scores.get("http://w3:8000"), Some(&4));
-    }
-
-    #[test]
-    fn test_jump_search_large_sequence() {
-        // Sequence larger than default jump_size to verify multiple jumps
+    fn test_early_exit_no_match() {
         let indexer = PositionalIndexer::new(64);
-        let content: Vec<u64> = (1..=200).collect();
-
-        let blocks_full = make_blocks(&content);
-        let blocks_half = make_blocks(&content[..100]);
-
-        indexer
-            .apply_stored("http://w1:8000", &blocks_full, None)
-            .unwrap();
-        indexer
-            .apply_stored("http://w2:8000", &blocks_half, None)
-            .unwrap();
-
-        let scores = indexer.find_matches(&hashes(&content));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&200));
-        assert_eq!(scores.scores.get("http://w2:8000"), Some(&100));
-    }
-
-    #[test]
-    fn test_single_block_store_and_match() {
-        let indexer = PositionalIndexer::default();
-        let blocks = make_blocks(&[42]);
-        indexer
-            .apply_stored("http://w1:8000", &blocks, None)
-            .unwrap();
-
-        let scores = indexer.find_matches(&hashes(&[42]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&1));
-        assert_eq!(scores.tree_sizes.get("http://w1:8000"), Some(&1));
-    }
-
-    #[test]
-    fn test_remove_all_blocks_one_by_one() {
-        let indexer = PositionalIndexer::default();
         let blocks = make_blocks(&[10, 20, 30]);
         indexer
             .apply_stored("http://w1:8000", &blocks, None)
             .unwrap();
 
-        // Remove in reverse order
-        for block in blocks.iter().rev() {
-            indexer.apply_removed("http://w1:8000", &[block.seq_hash]);
-        }
-
-        assert_eq!(indexer.current_size(), 0);
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]));
+        let scores = indexer.find_matches(&hashes(&[99, 88]), true);
         assert!(scores.scores.is_empty());
     }
 
+    // -----------------------------------------------------------------------
+    // worker_id tests
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_clear_nonexistent_worker_is_noop() {
+    fn test_worker_id_unknown() {
         let indexer = PositionalIndexer::default();
-        let blocks = make_blocks(&[10, 20]);
+        assert!(indexer.worker_id("http://unknown:8000").is_none());
+    }
+
+    #[test]
+    fn test_worker_id_after_store() {
+        let indexer = PositionalIndexer::default();
+        indexer
+            .apply_stored("http://w1:8000", &make_blocks(&[10]), None)
+            .unwrap();
+        assert!(indexer.worker_id("http://w1:8000").is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Atomic tree_sizes consistency
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tree_sizes_after_store_and_remove() {
+        let indexer = PositionalIndexer::new(64);
+        let blocks = make_blocks(&[10, 20, 30, 40, 50]);
         indexer
             .apply_stored("http://w1:8000", &blocks, None)
             .unwrap();
+        assert_eq!(indexer.current_size(), 5);
 
-        indexer.apply_cleared("http://w2:8000");
+        // Remove 2 blocks
+        indexer.apply_removed("http://w1:8000", &[blocks[3].seq_hash, blocks[4].seq_hash]);
+        assert_eq!(indexer.current_size(), 3);
 
-        // w1 should be unaffected
-        let scores = indexer.find_matches(&hashes(&[10, 20]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&2));
+        // Verify tree_sizes in query results
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
+        assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
     }
 
     #[test]
@@ -1229,8 +1322,9 @@ mod tests {
             let ch = hashes(&content);
             handles.push(std::thread::spawn(move || {
                 for _ in 0..100 {
-                    let scores = idx.find_matches(&ch);
-                    assert!(scores.scores.contains_key("http://w1:8000"));
+                    let scores = idx.find_matches(&ch, false);
+                    let w1 = idx.worker_id("http://w1:8000").unwrap();
+                    assert!(scores.scores.contains_key(&w1));
                 }
             }));
         }
@@ -1253,13 +1347,13 @@ mod tests {
         }
 
         // w1 should still be matchable
-        let scores = indexer.find_matches(&hashes(&content));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&20));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&content), false);
+        assert_eq!(scores.scores.get(&w1), Some(&20));
     }
 
     #[test]
     fn test_dashmap_cleanup_no_memory_leak() {
-        // Verify DashMap entries are cleaned up when last worker is removed
         let indexer = PositionalIndexer::default();
         let blocks = make_blocks(&[10, 20, 30]);
         indexer
@@ -1272,18 +1366,15 @@ mod tests {
         assert!(!indexer.index.is_empty());
 
         indexer.remove_worker("http://w1:8000");
-        // w2 still has entries, so DashMap should still have entries
         assert!(!indexer.index.is_empty());
 
         indexer.remove_worker("http://w2:8000");
-        // Both workers removed — DashMap should be empty
         assert_eq!(indexer.index.len(), 0);
     }
 
     #[test]
     fn test_compute_content_hash_empty_tokens() {
         let hash = compute_content_hash(&[]);
-        // Should produce a valid hash, not panic
         let hash2 = compute_content_hash(&[]);
         assert_eq!(hash, hash2);
     }
@@ -1296,7 +1387,6 @@ mod tests {
 
     #[test]
     fn test_seq_hash_rolling_correctness() {
-        // Verify that seq_hashes computed by ensure_seq_hash_computed match make_blocks
         let content = vec![10u64, 20, 30, 40, 50];
         let blocks = make_blocks(&content);
         let content_hashes = hashes(&content);
@@ -1314,17 +1404,16 @@ mod tests {
 
     #[test]
     fn test_query_prefix_of_stored() {
-        // Query is shorter than stored sequence
         let indexer = PositionalIndexer::default();
         let blocks = make_blocks(&[10, 20, 30, 40, 50]);
         indexer
             .apply_stored("http://w1:8000", &blocks, None)
             .unwrap();
 
-        let scores = indexer.find_matches(&hashes(&[10, 20]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&2));
-        // tree_size should still be 5 (full stored depth)
-        assert_eq!(scores.tree_sizes.get("http://w1:8000"), Some(&5));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&[10, 20]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&2));
+        assert_eq!(scores.tree_sizes.get(&w1), Some(&5));
     }
 
     #[test]
@@ -1339,15 +1428,16 @@ mod tests {
             .apply_stored("http://w2:8000", &blocks_w2, None)
             .unwrap();
 
-        // Query matching w1 only
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&3));
-        assert!(!scores.scores.contains_key("http://w2:8000"));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let w2 = indexer.worker_id("http://w2:8000").unwrap();
 
-        // Query matching w2 only
-        let scores = indexer.find_matches(&hashes(&[99, 88, 77]));
-        assert!(!scores.scores.contains_key("http://w1:8000"));
-        assert_eq!(scores.scores.get("http://w2:8000"), Some(&3));
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&3));
+        assert!(!scores.scores.contains_key(&w2));
+
+        let scores = indexer.find_matches(&hashes(&[99, 88, 77]), false);
+        assert!(!scores.scores.contains_key(&w1));
+        assert_eq!(scores.scores.get(&w2), Some(&3));
     }
 
     #[test]
@@ -1367,7 +1457,6 @@ mod tests {
             .unwrap();
         assert_eq!(indexer.current_size(), 3);
 
-        // Same blocks on different worker — size should be 6
         indexer
             .apply_stored("http://w2:8000", &blocks, None)
             .unwrap();
@@ -1389,7 +1478,6 @@ mod tests {
 
     #[test]
     fn test_request_hashes_basic() {
-        // 8 tokens with block_size=4 → 2 full blocks
         let tokens: Vec<u32> = (1..=8).collect();
         let hashes = compute_request_content_hashes(&tokens, 4);
         assert_eq!(hashes.len(), 2);
@@ -1399,7 +1487,6 @@ mod tests {
 
     #[test]
     fn test_request_hashes_partial_trailing_chunk_discarded() {
-        // 10 tokens with block_size=4 → 2 full blocks, trailing [9,10] discarded
         let tokens: Vec<u32> = (1..=10).collect();
         let hashes = compute_request_content_hashes(&tokens, 4);
         assert_eq!(hashes.len(), 2);
@@ -1407,7 +1494,6 @@ mod tests {
 
     #[test]
     fn test_request_hashes_fewer_than_block_size() {
-        // Fewer tokens than block_size → empty (no full blocks)
         let hashes = compute_request_content_hashes(&[1, 2, 3], 4);
         assert!(hashes.is_empty());
     }
@@ -1420,7 +1506,6 @@ mod tests {
 
     #[test]
     fn test_request_hashes_exact_multiple() {
-        // Exactly 3 blocks of size 2
         let tokens: Vec<u32> = (1..=6).collect();
         let hashes = compute_request_content_hashes(&tokens, 2);
         assert_eq!(hashes.len(), 3);
@@ -1434,7 +1519,6 @@ mod tests {
 
     #[test]
     fn test_request_hashes_block_size_1() {
-        // Each token is its own block
         let tokens = vec![10u32, 20, 30];
         let hashes = compute_request_content_hashes(&tokens, 1);
         assert_eq!(hashes.len(), 3);
@@ -1449,24 +1533,20 @@ mod tests {
 
     #[test]
     fn test_end_to_end_store_and_query() {
-        // Simulate: backend stores blocks computed from tokens [1..=16] with block_size=4.
-        // Router queries with the same tokens and block_size.
         let indexer = PositionalIndexer::default();
         let block_size = 4;
         let tokens: Vec<u32> = (1..=16).collect();
 
-        // Simulate store events: compute content hashes the same way the router will
         let content_hashes: Vec<ContentHash> = tokens
             .chunks(block_size)
             .map(compute_content_hash)
             .collect();
 
-        // Backend sends blocks with arbitrary seq_hashes (backend-specific algorithm)
         let blocks: Vec<StoredBlock> = content_hashes
             .iter()
             .enumerate()
             .map(|(i, &ch)| StoredBlock {
-                seq_hash: SequenceHash(0xBEEF_0000 + i as u64), // opaque backend hash
+                seq_hash: SequenceHash(0xBEEF_0000 + i as u64),
                 content_hash: ch,
             })
             .collect();
@@ -1475,10 +1555,10 @@ mod tests {
             .apply_stored("http://w1:8000", &blocks, None)
             .unwrap();
 
-        // Router queries: compute content hashes from request tokens
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
         let query_hashes = compute_request_content_hashes(&tokens, block_size);
-        let scores = indexer.find_matches(&query_hashes);
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&4));
+        let scores = indexer.find_matches(&query_hashes, false);
+        assert_eq!(scores.scores.get(&w1), Some(&4));
     }
 
     #[test]
@@ -1486,7 +1566,6 @@ mod tests {
         let indexer = PositionalIndexer::default();
         let block_size = 4;
 
-        // Worker cached tokens [1..=8] (2 blocks)
         let cached_tokens: Vec<u32> = (1..=8).collect();
         let blocks: Vec<StoredBlock> = cached_tokens
             .chunks(block_size)
@@ -1500,17 +1579,16 @@ mod tests {
             .apply_stored("http://w1:8000", &blocks, None)
             .unwrap();
 
-        // Request has tokens [1..=16] — first 2 blocks match, last 2 don't
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
         let query_tokens: Vec<u32> = (1..=16).collect();
         let query_hashes = compute_request_content_hashes(&query_tokens, block_size);
-        let scores = indexer.find_matches(&query_hashes);
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&2));
-        assert_eq!(scores.tree_sizes.get("http://w1:8000"), Some(&2));
+        let scores = indexer.find_matches(&query_hashes, false);
+        assert_eq!(scores.scores.get(&w1), Some(&2));
+        assert_eq!(scores.tree_sizes.get(&w1), Some(&2));
     }
 
     #[test]
     fn test_end_to_end_different_backends_same_content() {
-        // Two workers with different seq_hashes but same content (different backends)
         let indexer = PositionalIndexer::new(4);
         let block_size = 4;
         let tokens: Vec<u32> = (1..=8).collect();
@@ -1519,7 +1597,6 @@ mod tests {
             .map(compute_content_hash)
             .collect();
 
-        // Worker 1: SGLang-style seq_hashes
         let blocks_w1: Vec<StoredBlock> = content_hashes
             .iter()
             .enumerate()
@@ -1529,7 +1606,6 @@ mod tests {
             })
             .collect();
 
-        // Worker 2: vLLM-style seq_hashes (different values, same content)
         let blocks_w2: Vec<StoredBlock> = content_hashes
             .iter()
             .enumerate()
@@ -1546,15 +1622,16 @@ mod tests {
             .apply_stored("http://vllm:8000", &blocks_w2, None)
             .unwrap();
 
-        // Router query: both workers match on content
+        let sglang = indexer.worker_id("http://sglang:8000").unwrap();
+        let vllm = indexer.worker_id("http://vllm:8000").unwrap();
         let query_hashes = compute_request_content_hashes(&tokens, block_size);
-        let scores = indexer.find_matches(&query_hashes);
-        assert_eq!(scores.scores.get("http://sglang:8000"), Some(&2));
-        assert_eq!(scores.scores.get("http://vllm:8000"), Some(&2));
+        let scores = indexer.find_matches(&query_hashes, false);
+        assert_eq!(scores.scores.get(&sglang), Some(&2));
+        assert_eq!(scores.scores.get(&vllm), Some(&2));
     }
 
     // -----------------------------------------------------------------------
-    // Jump boundary tests: divergence at/near jump_size boundaries
+    // Jump boundary tests
     // -----------------------------------------------------------------------
 
     /// Helper: store a sequence for a worker via chained continuations of `chunk_size` blocks.
@@ -1578,8 +1655,6 @@ mod tests {
 
     #[test]
     fn test_divergence_at_jump_boundaries() {
-        // 128-block sequence, workers diverge at specific boundary positions.
-        // With jump_size=32, boundaries are at 32, 64, 96.
         let indexer = PositionalIndexer::new(32);
         let full: Vec<u64> = (1..=128).collect();
         let full_blocks = make_blocks(&full);
@@ -1587,7 +1662,6 @@ mod tests {
             .apply_stored("http://full:8000", &full_blocks, None)
             .unwrap();
 
-        // Workers diverge at positions 31, 32, 33 (around first jump boundary)
         for &depth in &[31, 32, 33] {
             let partial_blocks = make_blocks(&full[..depth]);
             let worker = format!("http://depth{depth}:8000");
@@ -1596,7 +1670,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Workers diverge at positions 63, 64, 65 (around second jump boundary)
         for &depth in &[63, 64, 65] {
             let partial_blocks = make_blocks(&full[..depth]);
             let worker = format!("http://depth{depth}:8000");
@@ -1605,19 +1678,18 @@ mod tests {
                 .unwrap();
         }
 
-        let scores = indexer.find_matches(&hashes(&full));
-        assert_eq!(scores.scores.get("http://full:8000"), Some(&128));
-        assert_eq!(scores.scores.get("http://depth31:8000"), Some(&31));
-        assert_eq!(scores.scores.get("http://depth32:8000"), Some(&32));
-        assert_eq!(scores.scores.get("http://depth33:8000"), Some(&33));
-        assert_eq!(scores.scores.get("http://depth63:8000"), Some(&63));
-        assert_eq!(scores.scores.get("http://depth64:8000"), Some(&64));
-        assert_eq!(scores.scores.get("http://depth65:8000"), Some(&65));
+        let scores = indexer.find_matches(&hashes(&full), false);
+        let full_id = indexer.worker_id("http://full:8000").unwrap();
+        assert_eq!(scores.scores.get(&full_id), Some(&128));
+        for &depth in &[31u64, 32, 33, 63, 64, 65] {
+            let worker = format!("http://depth{depth}:8000");
+            let wid = indexer.worker_id(&worker).unwrap();
+            assert_eq!(scores.scores.get(&wid), Some(&(depth as u32)));
+        }
     }
 
     #[test]
     fn test_exact_jump_size_sequences() {
-        // Sequences that are exact multiples of jump_size (32, 64, 96).
         let indexer = PositionalIndexer::new(32);
 
         for &len in &[32, 64, 96] {
@@ -1626,9 +1698,10 @@ mod tests {
             let worker = format!("http://len{len}:8000");
             indexer.apply_stored(&worker, &blocks, None).unwrap();
 
-            let scores = indexer.find_matches(&hashes(&content));
+            let wid = indexer.worker_id(&worker).unwrap();
+            let scores = indexer.find_matches(&hashes(&content), false);
             assert_eq!(
-                scores.scores.get(worker.as_str()),
+                scores.scores.get(&wid),
                 Some(&(len as u32)),
                 "exact match failed for sequence length {len}"
             );
@@ -1637,7 +1710,6 @@ mod tests {
 
     #[test]
     fn test_off_by_one_jump_boundaries() {
-        // Sequences at jump_size +/- 1 to catch off-by-one errors.
         let indexer = PositionalIndexer::new(32);
         let full: Vec<u64> = (1..=128).collect();
 
@@ -1647,9 +1719,10 @@ mod tests {
             let worker = format!("http://len{len}:8000");
             indexer.apply_stored(&worker, &blocks, None).unwrap();
 
-            let scores = indexer.find_matches(&hashes(content));
+            let wid = indexer.worker_id(&worker).unwrap();
+            let scores = indexer.find_matches(&hashes(content), false);
             assert_eq!(
-                scores.scores.get(worker.as_str()),
+                scores.scores.get(&wid),
                 Some(&(len as u32)),
                 "exact match failed for sequence length {len}"
             );
@@ -1658,8 +1731,6 @@ mod tests {
 
     #[test]
     fn test_staggered_workers_across_jump_boundaries() {
-        // 5 workers at depths 10, 20, 35, 64, 100 with jump_size=32.
-        // Tests drain tracking across multiple jump boundaries.
         let indexer = PositionalIndexer::new(32);
         let full: Vec<u64> = (1..=100).collect();
 
@@ -1670,11 +1741,12 @@ mod tests {
             indexer.apply_stored(&worker, &blocks, None).unwrap();
         }
 
-        let scores = indexer.find_matches(&hashes(&full));
+        let scores = indexer.find_matches(&hashes(&full), false);
         for &depth in &depths {
             let worker = format!("http://w{depth}:8000");
+            let wid = indexer.worker_id(&worker).unwrap();
             assert_eq!(
-                scores.scores.get(worker.as_str()),
+                scores.scores.get(&wid),
                 Some(&(depth as u32)),
                 "worker at depth {depth} has wrong score"
             );
@@ -1683,11 +1755,9 @@ mod tests {
 
     #[test]
     fn test_shared_prefix_diverge_at_jump_boundary() {
-        // 3 workers share 40-block prefix, then diverge with different suffixes.
         let indexer = PositionalIndexer::new(32);
         let shared: Vec<u64> = (1..=40).collect();
 
-        // Worker 1: shared + [1001..1060] = 100 blocks total
         let mut content_w1 = shared.clone();
         content_w1.extend(1001..=1060);
         let blocks_w1 = make_blocks(&content_w1);
@@ -1695,7 +1765,6 @@ mod tests {
             .apply_stored("http://w1:8000", &blocks_w1, None)
             .unwrap();
 
-        // Worker 2: shared + [2001..2020] = 60 blocks total
         let mut content_w2 = shared.clone();
         content_w2.extend(2001..=2020);
         let blocks_w2 = make_blocks(&content_w2);
@@ -1703,22 +1772,22 @@ mod tests {
             .apply_stored("http://w2:8000", &blocks_w2, None)
             .unwrap();
 
-        // Worker 3: shared only = 40 blocks
         let blocks_w3 = make_blocks(&shared);
         indexer
             .apply_stored("http://w3:8000", &blocks_w3, None)
             .unwrap();
 
-        // Query with w1's content: w1 gets 100, w2 and w3 drain at position 40
-        let scores = indexer.find_matches(&hashes(&content_w1));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&100));
-        assert_eq!(scores.scores.get("http://w2:8000"), Some(&40));
-        assert_eq!(scores.scores.get("http://w3:8000"), Some(&40));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let w2 = indexer.worker_id("http://w2:8000").unwrap();
+        let w3 = indexer.worker_id("http://w3:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&content_w1), false);
+        assert_eq!(scores.scores.get(&w1), Some(&100));
+        assert_eq!(scores.scores.get(&w2), Some(&40));
+        assert_eq!(scores.scores.get(&w3), Some(&40));
     }
 
     #[test]
     fn test_very_long_sequence() {
-        // 1000-block sequence: full match, prefix match, mid-divergence.
         let indexer = PositionalIndexer::new(64);
         let content: Vec<u64> = (1..=1000).collect();
         let blocks = make_blocks(&content);
@@ -1726,19 +1795,18 @@ mod tests {
             .apply_stored("http://w1:8000", &blocks, None)
             .unwrap();
 
-        // Full match
-        let scores = indexer.find_matches(&hashes(&content));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&1000));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
 
-        // Prefix match (query first 500)
-        let scores = indexer.find_matches(&hashes(&content[..500]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&500));
+        let scores = indexer.find_matches(&hashes(&content), false);
+        assert_eq!(scores.scores.get(&w1), Some(&1000));
 
-        // Divergence: first 499 match, then different content
+        let scores = indexer.find_matches(&hashes(&content[..500]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&500));
+
         let mut divergent = content[..499].to_vec();
         divergent.push(999999);
-        let scores = indexer.find_matches(&hashes(&divergent));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&499));
+        let scores = indexer.find_matches(&hashes(&divergent), false);
+        assert_eq!(scores.scores.get(&w1), Some(&499));
     }
 
     // -----------------------------------------------------------------------
@@ -1747,62 +1815,56 @@ mod tests {
 
     #[test]
     fn test_deep_continuation_chain() {
-        // Build 200-block sequence via 20 continuations of 10 blocks each.
         let indexer = PositionalIndexer::new(64);
         let content: Vec<u64> = (1..=200).collect();
         store_via_continuations(&indexer, "http://w1:8000", &content, 10);
 
         assert_eq!(indexer.current_size(), 200);
 
-        // Full match
-        let scores = indexer.find_matches(&hashes(&content));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&200));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&content), false);
+        assert_eq!(scores.scores.get(&w1), Some(&200));
 
-        // Partial match at depth 150
-        let scores = indexer.find_matches(&hashes(&content[..150]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&150));
+        let scores = indexer.find_matches(&hashes(&content[..150]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&150));
     }
 
     #[test]
     fn test_continuation_chain_with_multiple_workers() {
-        // Two workers: w1 builds 100 blocks via 10 continuations,
-        // w2 builds 50 blocks via 5 continuations (same content prefix).
         let indexer = PositionalIndexer::new(32);
         let content: Vec<u64> = (1..=100).collect();
 
         store_via_continuations(&indexer, "http://w1:8000", &content, 10);
         store_via_continuations(&indexer, "http://w2:8000", &content[..50], 10);
 
-        let scores = indexer.find_matches(&hashes(&content));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&100));
-        assert_eq!(scores.scores.get("http://w2:8000"), Some(&50));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let w2 = indexer.worker_id("http://w2:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&content), false);
+        assert_eq!(scores.scores.get(&w1), Some(&100));
+        assert_eq!(scores.scores.get(&w2), Some(&50));
     }
 
     #[test]
     fn test_multiple_disjoint_sequences_per_worker() {
-        // Same worker stores two completely disjoint sequences (no shared prefix).
         let indexer = PositionalIndexer::new(64);
 
-        // Sequence 1: content [10, 20, 30] at positions 0-2
         let blocks1 = make_blocks(&[10, 20, 30]);
         indexer
             .apply_stored("http://w1:8000", &blocks1, None)
             .unwrap();
 
-        // Sequence 2: content [100, 200, 300, 400] at positions 0-3
-        // This overwrites positions 0-2 for w1 (same positions, different content)
         let blocks2 = make_blocks(&[100, 200, 300, 400]);
         indexer
             .apply_stored("http://w1:8000", &blocks2, None)
             .unwrap();
 
-        // Query for sequence 2: w1 matches all 4
-        let scores = indexer.find_matches(&hashes(&[100, 200, 300, 400]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&4));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
 
-        // Query for sequence 1: w1 also matches all 3 (both sequences indexed independently)
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&3));
+        let scores = indexer.find_matches(&hashes(&[100, 200, 300, 400]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&4));
+
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&3));
     }
 
     // -----------------------------------------------------------------------
@@ -1811,8 +1873,6 @@ mod tests {
 
     #[test]
     fn test_long_sequence_partial_removal() {
-        // Store 100 blocks, remove the last 20 (blocks 80-99).
-        // Verify remaining 80 blocks still match.
         let indexer = PositionalIndexer::new(32);
         let content: Vec<u64> = (1..=100).collect();
         let blocks = make_blocks(&content);
@@ -1820,84 +1880,66 @@ mod tests {
             .apply_stored("http://w1:8000", &blocks, None)
             .unwrap();
 
-        // Remove blocks at positions 80-99 (seq_hashes from those blocks)
         let to_remove: Vec<SequenceHash> = blocks[80..].iter().map(|b| b.seq_hash).collect();
         indexer.apply_removed("http://w1:8000", &to_remove);
 
         assert_eq!(indexer.current_size(), 80);
 
-        // Query full 100: only first 80 match
-        let scores = indexer.find_matches(&hashes(&content));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&80));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&content), false);
+        assert_eq!(scores.scores.get(&w1), Some(&80));
 
-        // Query first 80: all match
-        let scores = indexer.find_matches(&hashes(&content[..80]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&80));
+        let scores = indexer.find_matches(&hashes(&content[..80]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&80));
     }
 
     #[test]
     fn test_remove_parent_does_not_cascade() {
-        // Removing a block at position 1 does NOT remove children at positions 2-4.
-        // The positional indexer stores blocks independently — no parent-child pointers.
-        //
-        // With jump_size > sequence length, the jump skips directly from position 0
-        // to the last position, bypassing the removed middle block entirely.
-        // Use jump_size=1 to force linear scan and detect the gap.
         let indexer = PositionalIndexer::new(1);
         let blocks = make_blocks(&[10, 20, 30, 40, 50]);
         indexer
             .apply_stored("http://w1:8000", &blocks, None)
             .unwrap();
 
-        // Remove block at position 1 (content_hash=20)
         indexer.apply_removed("http://w1:8000", &[blocks[1].seq_hash]);
 
-        // Children at positions 2-4 are NOT removed (no cascade)
         assert_eq!(indexer.current_size(), 4);
 
-        // With linear scan (jump_size=1): position 0 matches, position 1 misses → score 1.
-        // Positions 2-4 are still indexed but unreachable via prefix matching
-        // because the scan terminates at the gap.
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30, 40, 50]));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&1));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30, 40, 50]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&1));
     }
 
     #[test]
     fn test_long_sequence_clear_and_rebuild() {
-        // Clear a 100-block sequence, rebuild with 100 different blocks.
-        // Verify old data is completely gone.
         let indexer = PositionalIndexer::new(32);
 
-        // Store original
         let original: Vec<u64> = (1..=100).collect();
         let blocks = make_blocks(&original);
         indexer
             .apply_stored("http://w1:8000", &blocks, None)
             .unwrap();
 
-        // Clear
         indexer.apply_cleared("http://w1:8000");
         assert_eq!(indexer.current_size(), 0);
 
-        // Rebuild with different content
         let replacement: Vec<u64> = (1001..=1100).collect();
         let new_blocks = make_blocks(&replacement);
         indexer
             .apply_stored("http://w1:8000", &new_blocks, None)
             .unwrap();
 
-        // Old content: no match
-        let scores = indexer.find_matches(&hashes(&original));
-        assert!(!scores.scores.contains_key("http://w1:8000"));
+        let w1 = indexer.worker_id("http://w1:8000").unwrap();
 
-        // New content: full match
-        let scores = indexer.find_matches(&hashes(&replacement));
-        assert_eq!(scores.scores.get("http://w1:8000"), Some(&100));
+        let scores = indexer.find_matches(&hashes(&original), false);
+        assert!(!scores.scores.contains_key(&w1));
+
+        let scores = indexer.find_matches(&hashes(&replacement), false);
+        assert_eq!(scores.scores.get(&w1), Some(&100));
     }
 
     #[test]
     fn test_interleaved_long_sequences() {
-        // 4 workers with shared prefix, staggered at 25/50/75/100 blocks.
         let indexer = PositionalIndexer::new(32);
         let content: Vec<u64> = (1..=100).collect();
 
@@ -1908,21 +1950,17 @@ mod tests {
             indexer.apply_stored(&worker, &blocks, None).unwrap();
         }
 
-        let scores = indexer.find_matches(&hashes(&content));
+        let scores = indexer.find_matches(&hashes(&content), false);
         for &depth in &depths {
             let worker = format!("http://w{depth}:8000");
+            let wid = indexer.worker_id(&worker).unwrap();
             assert_eq!(
-                scores.scores.get(worker.as_str()),
+                scores.scores.get(&wid),
                 Some(&(depth as u32)),
                 "worker at depth {depth} has wrong score"
             );
-        }
-
-        // Verify tree_sizes
-        for &depth in &depths {
-            let worker = format!("http://w{depth}:8000");
             assert_eq!(
-                scores.tree_sizes.get(worker.as_str()),
+                scores.tree_sizes.get(&wid),
                 Some(&depth),
                 "worker at depth {depth} has wrong tree_size"
             );
