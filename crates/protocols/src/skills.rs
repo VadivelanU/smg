@@ -90,30 +90,6 @@ impl<'de> Deserialize<'de> for ResponsesSkillEntry {
     }
 }
 
-/// Accepted in `X-SMG-Skills` for `/v1/chat/completions`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(tag = "type")]
-pub enum ChatCompletionsSkillRef {
-    #[serde(rename = "custom")]
-    Custom {
-        skill_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        version: Option<SkillVersionRef>,
-    },
-    #[serde(rename = "openai")]
-    OpenAI {
-        skill_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        version: Option<String>,
-    },
-    #[serde(rename = "anthropic")]
-    Anthropic {
-        skill_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        version: Option<String>,
-    },
-}
-
 /// Version reference accepted by skill attachment surfaces.
 ///
 /// Deserialization is intentionally manual to reject ambiguous numeric strings
