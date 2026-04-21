@@ -10,14 +10,328 @@ use validator::{Validate, ValidationError};
 use super::{
     common::{
         default_true, validate_stop, ChatLogProbs, ContextManagementEntry, Detail, Function,
-        GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo, ResponsePrompt,
-        StreamOptions, StringOrArray, ToolChoice, ToolChoiceValue, ToolReference, UsageInfo,
+        FunctionChoice, GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo,
+        ResponsePrompt, StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
+        ToolChoiceValue as ChatToolChoiceValue, ToolReference, UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
 use crate::{
     builders::ResponsesResponseBuilder, skills::ResponsesSkillEntry, validated::Normalizable,
 };
+
+// ============================================================================
+// Responses API Tool Choice
+// ============================================================================
+
+/// Simple tool-choice option strings supported by the Responses API.
+///
+/// Spec: `tool_choice` may be the bare string `"none"`, `"auto"`, or `"required"`.
+/// Shared chat/responses semantics but the Responses type owns its own enum so
+/// chat-path validators cannot accept unknown Responses variants by accident.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoiceOptions {
+    None,
+    Auto,
+    Required,
+}
+
+/// Single-value tag used to force the `"type": "function"` discriminator on the
+/// flat function-selection variant so the untagged outer enum can distinguish
+/// `Function` from `AllowedTools` / `Mcp` / `Custom` / `Types`.
+///
+/// Responses spec: `{"type": "function", "name": "..."}` — note the **flat**
+/// shape (no nested `function` object). This differs from Chat Completions
+/// which wraps the name in `{"function": {"name": "..."}}`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub enum FunctionToolChoiceTag {
+    #[serde(rename = "function")]
+    Function,
+}
+
+/// Tag enum forcing the `"type": "allowed_tools"` discriminator.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub enum AllowedToolsToolChoiceTag {
+    #[serde(rename = "allowed_tools")]
+    AllowedTools,
+}
+
+/// Tag enum forcing the `"type": "mcp"` discriminator.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub enum McpToolChoiceTag {
+    #[serde(rename = "mcp")]
+    Mcp,
+}
+
+/// Tag enum forcing the `"type": "custom"` discriminator.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub enum CustomToolChoiceTag {
+    #[serde(rename = "custom")]
+    Custom,
+}
+
+/// Tag enum forcing the `"type": "apply_patch"` discriminator.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub enum ApplyPatchToolChoiceTag {
+    #[serde(rename = "apply_patch")]
+    ApplyPatch,
+}
+
+/// Tag enum forcing the `"type": "shell"` discriminator.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub enum ShellToolChoiceTag {
+    #[serde(rename = "shell")]
+    Shell,
+}
+
+/// Built-in (hosted) tool types that can be referenced directly by
+/// `tool_choice: {"type": "..."}` in the Responses API.
+///
+/// Each variant is a distinct string per the spec — we keep multiple
+/// `web_search_preview*` forms because the spec enumerates them separately
+/// and older clients may still send the versioned aliases.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltInToolChoiceType {
+    FileSearch,
+    WebSearch,
+    WebSearchPreview,
+    #[serde(rename = "web_search_preview_2025_03_11")]
+    WebSearchPreview20250311,
+    ImageGeneration,
+    ComputerUsePreview,
+    CodeInterpreter,
+}
+
+/// Canonical payload for the Responses API `Function` tool-choice variant.
+///
+/// Serializes as the spec-flat shape `{"type": "function", "name": "..."}`.
+///
+/// Deserialization accepts **both** wire shapes for backward compatibility
+/// with smg clients written against the pre-split shared `ToolChoice` type
+/// (which used the Chat-style nested `{"function": {"name": "..."}}` layout
+/// on the Responses endpoint):
+///
+/// * Canonical flat: `{"type": "function", "name": "..."}`
+/// * Legacy nested:  `{"type": "function", "function": {"name": "..."}}`
+///
+/// Either shape normalizes to `name: String` at deserialize time so the rest
+/// of the gateway only ever sees the canonical form.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct ResponsesFunctionToolChoice {
+    #[serde(rename = "type")]
+    pub tool_type: FunctionToolChoiceTag,
+    pub name: String,
+}
+
+impl<'de> Deserialize<'de> for ResponsesFunctionToolChoice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Accept either the spec-flat `{type, name}` or the legacy
+        // Chat-nested `{type, function: {name}}` shape. The helper lets
+        // both fields be absent so serde can bind whichever wire form
+        // the caller sent; we then pick one and fail loudly if neither
+        // provides a function name.
+        #[derive(Deserialize)]
+        struct Helper {
+            #[serde(rename = "type")]
+            tool_type: FunctionToolChoiceTag,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            function: Option<FunctionChoice>,
+        }
+
+        let helper = Helper::deserialize(deserializer)?;
+        let name = helper
+            .name
+            .or_else(|| helper.function.map(|f| f.name))
+            .ok_or_else(|| {
+                serde::de::Error::custom(
+                    "tool_choice function requires a `name` field or a `function.name` field",
+                )
+            })?;
+        Ok(Self {
+            tool_type: helper.tool_type,
+            name,
+        })
+    }
+}
+
+/// `tool_choice` accepted on the Responses API (`POST /v1/responses`).
+///
+/// The Responses spec enumerates eight concrete wire shapes, each with a
+/// distinct discriminator — see `ResponsesToolChoice` variants below.
+/// Deserialised via `#[serde(untagged)]` because the outermost JSON is
+/// either a bare string (`Options`) or an object whose `"type"` picks
+/// the variant.
+///
+/// Each object variant pins the discriminator through a single-value tag
+/// enum (`FunctionToolChoiceTag`, etc.) so serde cannot match a payload
+/// whose `type` does not belong to that variant. Without the tag pinning,
+/// the `#[serde(untagged)]` enum would accept any object shape that
+/// happened to fit the field set of an earlier variant.
+///
+/// This type deliberately does NOT live in `common.rs`: Chat Completions
+/// has its own `ToolChoice` with a different `Function` wire shape
+/// (nested `{"function": {"name": ...}}`) and does not accept the
+/// `Types` / `Mcp` / `Custom` / `ApplyPatch` / `Shell` variants at all.
+/// Sharing one enum across both APIs would silently accept spec-invalid
+/// payloads on `/v1/chat/completions`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ResponsesToolChoice {
+    /// `"none"` | `"auto"` | `"required"`.
+    Options(ToolChoiceOptions),
+
+    /// `{"type": "file_search" | "web_search" | "web_search_preview" |
+    /// "web_search_preview_2025_03_11" | "image_generation" |
+    /// "computer_use_preview" | "code_interpreter"}` — select a built-in
+    /// hosted tool by type alone (no additional payload).
+    Types {
+        #[serde(rename = "type")]
+        tool_type: BuiltInToolChoiceType,
+    },
+
+    /// `{"type": "function", "name": "..."}` — Responses spec flat shape.
+    ///
+    /// Accepts both the spec-canonical flat wire shape and the legacy
+    /// Chat-style nested shape (`{"type": "function", "function": {"name": "..."}}`)
+    /// on deserialize to preserve backward compatibility with smg clients
+    /// written against the pre-split shared `ToolChoice` type. Always
+    /// serializes as the canonical flat shape per the OpenAI Responses spec
+    /// — Postel's law: liberal on input, conservative on output.
+    ///
+    /// The nested legacy shape is gated behind a custom `Deserialize` impl on
+    /// `ResponsesFunctionToolChoice`; the untagged outer enum still pins the
+    /// `"type": "function"` discriminator via `FunctionToolChoiceTag` so
+    /// payloads without that tag cannot reach this variant.
+    Function(ResponsesFunctionToolChoice),
+
+    /// `{"type": "allowed_tools", "mode": "auto"|"required", "tools": [...]}`.
+    ///
+    /// `tools` is an array of `ToolReference` items — the same type reused
+    /// from Chat's Allowed Tools payload because the Responses spec also
+    /// allows function / mcp / file_search / web_search_preview /
+    /// computer_use_preview / code_interpreter / image_generation entries.
+    AllowedTools {
+        #[serde(rename = "type")]
+        tool_type: AllowedToolsToolChoiceTag,
+        /// `"auto"` or `"required"`. Validated at request-normalisation time
+        /// (see `validate_tool_choice_with_tools`).
+        mode: String,
+        tools: Vec<ToolReference>,
+    },
+
+    /// `{"type": "mcp", "server_label": "...", "name"?: "..."}` — force
+    /// routing to a specific MCP server, optionally pinning a tool name.
+    Mcp {
+        #[serde(rename = "type")]
+        tool_type: McpToolChoiceTag,
+        server_label: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+
+    /// `{"type": "custom", "name": "..."}` — pin a user-registered
+    /// custom tool by name.
+    Custom {
+        #[serde(rename = "type")]
+        tool_type: CustomToolChoiceTag,
+        name: String,
+    },
+
+    /// `{"type": "apply_patch"}` — force the built-in `apply_patch` tool.
+    ApplyPatch {
+        #[serde(rename = "type")]
+        tool_type: ApplyPatchToolChoiceTag,
+    },
+
+    /// `{"type": "shell"}` — force the built-in `shell` tool.
+    Shell {
+        #[serde(rename = "type")]
+        tool_type: ShellToolChoiceTag,
+    },
+}
+
+impl Default for ResponsesToolChoice {
+    fn default() -> Self {
+        Self::Options(ToolChoiceOptions::Auto)
+    }
+}
+
+impl ResponsesToolChoice {
+    /// Serialize tool_choice to string for ResponsesResponse payloads.
+    ///
+    /// Returns the JSON-serialized tool_choice or `"auto"` as default.
+    pub fn serialize_to_string(tool_choice: Option<&ResponsesToolChoice>) -> String {
+        tool_choice
+            .map(|tc| serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string()))
+            .unwrap_or_else(|| "auto".to_string())
+    }
+
+    /// Return the pinned function name for the `Function` variant, regardless
+    /// of which wire shape (spec-flat `name` or legacy nested `function.name`)
+    /// was used at deserialize time. `None` for any non-`Function` variant.
+    ///
+    /// Consumers that need to project / validate the function name should go
+    /// through this accessor rather than pattern-matching so future wire
+    /// shapes can be added without touching call sites.
+    pub fn function_name(&self) -> Option<&str> {
+        match self {
+            Self::Function(payload) => Some(payload.name.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Project the Responses-level tool_choice onto a Chat Completions
+    /// tool_choice when a Responses request is being routed through the
+    /// Chat Completions gRPC pipeline.
+    ///
+    /// Mapping rules:
+    /// - `Options(None|Auto|Required)` → `ChatToolChoice::Value(...)` — shared
+    ///   semantics.
+    /// - `Function { name }` → `ChatToolChoice::Function { nested name }` —
+    ///   shape translation (flat Responses → nested Chat wire form).
+    /// - `AllowedTools { mode, tools }` → `ChatToolChoice::AllowedTools {...}`.
+    /// - Hosted / custom / apply_patch / shell / mcp — Chat Completions has no
+    ///   equivalent spec variant; fall back to `Auto` so the downstream chat
+    ///   backend still runs with tool-calling enabled.
+    pub fn to_chat_tool_choice(&self) -> ChatToolChoice {
+        match self {
+            Self::Options(ToolChoiceOptions::None) => {
+                ChatToolChoice::Value(ChatToolChoiceValue::None)
+            }
+            Self::Options(ToolChoiceOptions::Auto) => {
+                ChatToolChoice::Value(ChatToolChoiceValue::Auto)
+            }
+            Self::Options(ToolChoiceOptions::Required) => {
+                ChatToolChoice::Value(ChatToolChoiceValue::Required)
+            }
+            Self::Function(payload) => ChatToolChoice::Function {
+                tool_type: "function".to_string(),
+                function: FunctionChoice {
+                    name: payload.name.clone(),
+                },
+            },
+            Self::AllowedTools { mode, tools, .. } => ChatToolChoice::AllowedTools {
+                tool_type: "allowed_tools".to_string(),
+                mode: mode.clone(),
+                tools: tools.clone(),
+            },
+            // No matching Chat spec variant — fall through to `auto` so
+            // downstream Chat backends still see tool-calling enabled.
+            Self::Types { .. }
+            | Self::Mcp { .. }
+            | Self::Custom { .. }
+            | Self::ApplyPatch { .. }
+            | Self::Shell { .. } => ChatToolChoice::Value(ChatToolChoiceValue::Auto),
+        }
+    }
+}
 
 // ============================================================================
 // Response Tools (MCP and others)
@@ -949,9 +1263,9 @@ pub struct ResponsesRequest {
     #[validate(range(min = 0.0, max = 2.0))]
     pub temperature: Option<f32>,
 
-    /// Tool choice behavior
+    /// Tool choice behavior (Responses-spec enum — see `ResponsesToolChoice`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<ToolChoice>,
+    pub tool_choice: Option<ResponsesToolChoice>,
 
     /// Available tools
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1113,11 +1427,11 @@ impl Normalizable for ResponsesRequest {
         if self.tool_choice.is_none() {
             if let Some(tools) = &self.tools {
                 let choice_value = if tools.is_empty() {
-                    ToolChoiceValue::None
+                    ToolChoiceOptions::None
                 } else {
-                    ToolChoiceValue::Auto
+                    ToolChoiceOptions::Auto
                 };
-                self.tool_choice = Some(ToolChoice::Value(choice_value));
+                self.tool_choice = Some(ResponsesToolChoice::Options(choice_value));
             }
             // If tools is None, leave tool_choice as None (don't set it)
         }
@@ -1257,7 +1571,10 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
     };
 
     let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
-    let is_some_choice = !matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None));
+    let is_some_choice = !matches!(
+        tool_choice,
+        ResponsesToolChoice::Options(ToolChoiceOptions::None)
+    );
 
     // Check if tool_choice requires tools but none are provided
     if is_some_choice && !has_tools {
@@ -1286,20 +1603,24 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
 
     // Validate tool references exist
     match tool_choice {
-        ToolChoice::Function { function, .. } => {
-            if !function_tool_names.contains(&function.name.as_str()) {
-                let mut e = ValidationError::new("tool_choice_function_not_found");
-                e.message = Some(
-                    format!(
-                        "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
-                        function.name
-                    )
-                    .into(),
-                );
-                return Err(e);
+        ResponsesToolChoice::Function(_) => {
+            // Accessor goes through `function_name()` so we stay agnostic to
+            // the underlying wire shape (flat vs. legacy nested) — both are
+            // normalized at deserialize time.
+            if let Some(name) = tool_choice.function_name() {
+                if !function_tool_names.contains(&name) {
+                    let mut e = ValidationError::new("tool_choice_function_not_found");
+                    e.message = Some(
+                        format!(
+                            "Invalid value for 'tool_choice': function '{name}' not found in 'tools'.",
+                        )
+                        .into(),
+                    );
+                    return Err(e);
+                }
             }
         }
-        ToolChoice::AllowedTools {
+        ResponsesToolChoice::AllowedTools {
             mode,
             tools: allowed_tools,
             ..
@@ -1334,7 +1655,15 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
                 // as they are resolved dynamically at runtime
             }
         }
-        ToolChoice::Value(_) => {}
+        // Remaining variants have no cross-field existence constraints —
+        // hosted built-ins, MCP server selection, custom tool names, and
+        // `apply_patch` / `shell` are resolved at routing time.
+        ResponsesToolChoice::Options(_)
+        | ResponsesToolChoice::Types { .. }
+        | ResponsesToolChoice::Mcp { .. }
+        | ResponsesToolChoice::Custom { .. }
+        | ResponsesToolChoice::ApplyPatch { .. }
+        | ResponsesToolChoice::Shell { .. } => {}
     }
 
     Ok(())
@@ -2366,5 +2695,343 @@ mod tests {
             msg.contains("totally_made_up") || msg.contains("unknown variant"),
             "error should mention the unknown variant, got: {msg}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // P7: ResponsesToolChoice round-trip tests (all 8 spec variants)
+    // ------------------------------------------------------------------
+
+    /// Options: `"none"` | `"auto"` | `"required"` deserialize as bare strings
+    /// and re-serialize identically.
+    #[test]
+    fn responses_tool_choice_options_round_trip() {
+        for (payload, expected) in [
+            (json!("none"), ToolChoiceOptions::None),
+            (json!("auto"), ToolChoiceOptions::Auto),
+            (json!("required"), ToolChoiceOptions::Required),
+        ] {
+            let choice: ResponsesToolChoice =
+                serde_json::from_value(payload.clone()).expect("options string should deserialize");
+            match &choice {
+                ResponsesToolChoice::Options(opt) => assert_eq!(opt, &expected),
+                other => panic!("expected Options, got {other:?}"),
+            }
+            let reserialized = serde_json::to_value(&choice).expect("serialize");
+            assert_eq!(reserialized, payload);
+        }
+    }
+
+    /// Types: `{"type": "<built-in>"}` for every hosted tool the spec enumerates.
+    #[test]
+    fn responses_tool_choice_types_round_trip() {
+        for (payload, expected) in [
+            (
+                json!({"type": "file_search"}),
+                BuiltInToolChoiceType::FileSearch,
+            ),
+            (
+                json!({"type": "web_search"}),
+                BuiltInToolChoiceType::WebSearch,
+            ),
+            (
+                json!({"type": "web_search_preview"}),
+                BuiltInToolChoiceType::WebSearchPreview,
+            ),
+            (
+                json!({"type": "web_search_preview_2025_03_11"}),
+                BuiltInToolChoiceType::WebSearchPreview20250311,
+            ),
+            (
+                json!({"type": "image_generation"}),
+                BuiltInToolChoiceType::ImageGeneration,
+            ),
+            (
+                json!({"type": "computer_use_preview"}),
+                BuiltInToolChoiceType::ComputerUsePreview,
+            ),
+            (
+                json!({"type": "code_interpreter"}),
+                BuiltInToolChoiceType::CodeInterpreter,
+            ),
+        ] {
+            let choice: ResponsesToolChoice =
+                serde_json::from_value(payload.clone()).expect("types object should deserialize");
+            match &choice {
+                ResponsesToolChoice::Types { tool_type } => assert_eq!(tool_type, &expected),
+                other => panic!("expected Types, got {other:?}"),
+            }
+            let reserialized = serde_json::to_value(&choice).expect("serialize");
+            assert_eq!(reserialized, payload);
+        }
+    }
+
+    /// Function: `{"type": "function", "name": "..."}` — spec-canonical flat
+    /// shape round-trips unchanged.
+    #[test]
+    fn responses_tool_choice_function_round_trip() {
+        let payload = json!({"type": "function", "name": "get_weather"});
+        let choice: ResponsesToolChoice = serde_json::from_value(payload.clone())
+            .expect("function flat shape should deserialize");
+        match &choice {
+            ResponsesToolChoice::Function(payload) => assert_eq!(payload.name, "get_weather"),
+            other => panic!("expected Function, got {other:?}"),
+        }
+        assert_eq!(choice.function_name(), Some("get_weather"));
+        let reserialized = serde_json::to_value(&choice).expect("serialize");
+        assert_eq!(reserialized, payload);
+    }
+
+    /// Backward compat: the Chat-style nested `{"function": {"name": ...}}`
+    /// wire shape was accepted on the Responses endpoint before the P7
+    /// split and existing smg clients + e2e tests rely on it. We accept it
+    /// on deserialize (Postel: liberal on input) but always emit the
+    /// canonical flat shape on serialize (conservative on output).
+    #[test]
+    fn responses_tool_choice_function_accepts_legacy_nested() {
+        let legacy_nested = json!({
+            "type": "function",
+            "function": {"name": "search_web"}
+        });
+        let choice: ResponsesToolChoice = serde_json::from_value(legacy_nested)
+            .expect("legacy nested function shape must deserialize for backward compat");
+
+        // Internal state is normalized to the flat `name` field regardless of
+        // which wire shape we read.
+        match &choice {
+            ResponsesToolChoice::Function(payload) => {
+                assert_eq!(payload.name, "search_web");
+                assert_eq!(payload.tool_type, FunctionToolChoiceTag::Function);
+            }
+            other => panic!("expected Function, got {other:?}"),
+        }
+        assert_eq!(choice.function_name(), Some("search_web"));
+
+        // Serialize MUST emit the canonical flat shape, not the nested legacy
+        // shape that came in on the wire.
+        let reserialized = serde_json::to_value(&choice).expect("serialize");
+        assert_eq!(
+            reserialized,
+            json!({"type": "function", "name": "search_web"}),
+            "Responses `Function` must serialize as canonical flat even when \
+             deserialized from the legacy nested shape"
+        );
+        assert!(
+            reserialized.get("function").is_none(),
+            "canonical flat serialize must not emit a nested `function` object"
+        );
+    }
+
+    /// Payloads without either `name` or `function.name` must fail —
+    /// we accept both wire shapes, but at least one of them must carry the
+    /// function name. (The exact error string comes from serde's untagged
+    /// enum routing which swallows inner errors, so we assert only that
+    /// deserialization fails.)
+    #[test]
+    fn responses_tool_choice_function_rejects_missing_name() {
+        let payload = json!({"type": "function"});
+        assert!(
+            serde_json::from_value::<ResponsesToolChoice>(payload).is_err(),
+            "function without `name` or `function.name` must be rejected",
+        );
+    }
+
+    /// AllowedTools: `{"type": "allowed_tools", "mode", "tools"}` with Function
+    /// references; validates ToolReference interop.
+    #[test]
+    fn responses_tool_choice_allowed_tools_round_trip() {
+        let payload = json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [{"type": "function", "name": "get_weather"}]
+        });
+        let choice: ResponsesToolChoice =
+            serde_json::from_value(payload.clone()).expect("allowed_tools should deserialize");
+        match &choice {
+            ResponsesToolChoice::AllowedTools { mode, tools, .. } => {
+                assert_eq!(mode, "auto");
+                assert_eq!(tools.len(), 1);
+                match &tools[0] {
+                    ToolReference::Function { name } => assert_eq!(name, "get_weather"),
+                    other => panic!("expected Function reference, got {other:?}"),
+                }
+            }
+            other => panic!("expected AllowedTools, got {other:?}"),
+        }
+        let reserialized = serde_json::to_value(&choice).expect("serialize");
+        assert_eq!(reserialized, payload);
+    }
+
+    /// Mcp: `{"type": "mcp", "server_label", "name"?}` with and without the
+    /// optional `name`.
+    #[test]
+    fn responses_tool_choice_mcp_round_trip() {
+        // With `name`
+        let payload_with_name = json!({
+            "type": "mcp",
+            "server_label": "my_server",
+            "name": "search"
+        });
+        let choice: ResponsesToolChoice = serde_json::from_value(payload_with_name.clone())
+            .expect("mcp with name should deserialize");
+        match &choice {
+            ResponsesToolChoice::Mcp {
+                server_label, name, ..
+            } => {
+                assert_eq!(server_label, "my_server");
+                assert_eq!(name.as_deref(), Some("search"));
+            }
+            other => panic!("expected Mcp, got {other:?}"),
+        }
+        let reserialized = serde_json::to_value(&choice).expect("serialize");
+        assert_eq!(reserialized, payload_with_name);
+
+        // Without `name`
+        let payload_no_name = json!({
+            "type": "mcp",
+            "server_label": "my_server"
+        });
+        let choice: ResponsesToolChoice = serde_json::from_value(payload_no_name.clone())
+            .expect("mcp without name should deserialize");
+        match &choice {
+            ResponsesToolChoice::Mcp {
+                server_label, name, ..
+            } => {
+                assert_eq!(server_label, "my_server");
+                assert!(name.is_none());
+            }
+            other => panic!("expected Mcp, got {other:?}"),
+        }
+        let reserialized = serde_json::to_value(&choice).expect("serialize");
+        assert_eq!(reserialized, payload_no_name);
+    }
+
+    /// Custom: `{"type": "custom", "name": "..."}` — user-registered tool by name.
+    #[test]
+    fn responses_tool_choice_custom_round_trip() {
+        let payload = json!({"type": "custom", "name": "my_custom_tool"});
+        let choice: ResponsesToolChoice =
+            serde_json::from_value(payload.clone()).expect("custom should deserialize");
+        match &choice {
+            ResponsesToolChoice::Custom { name, .. } => assert_eq!(name, "my_custom_tool"),
+            other => panic!("expected Custom, got {other:?}"),
+        }
+        let reserialized = serde_json::to_value(&choice).expect("serialize");
+        assert_eq!(reserialized, payload);
+    }
+
+    /// ApplyPatch: `{"type": "apply_patch"}`.
+    #[test]
+    fn responses_tool_choice_apply_patch_round_trip() {
+        let payload = json!({"type": "apply_patch"});
+        let choice: ResponsesToolChoice =
+            serde_json::from_value(payload.clone()).expect("apply_patch should deserialize");
+        assert!(matches!(choice, ResponsesToolChoice::ApplyPatch { .. }));
+        let reserialized = serde_json::to_value(&choice).expect("serialize");
+        assert_eq!(reserialized, payload);
+    }
+
+    /// Shell: `{"type": "shell"}`.
+    #[test]
+    fn responses_tool_choice_shell_round_trip() {
+        let payload = json!({"type": "shell"});
+        let choice: ResponsesToolChoice =
+            serde_json::from_value(payload.clone()).expect("shell should deserialize");
+        assert!(matches!(choice, ResponsesToolChoice::Shell { .. }));
+        let reserialized = serde_json::to_value(&choice).expect("serialize");
+        assert_eq!(reserialized, payload);
+    }
+
+    /// Projection onto Chat Completions' ToolChoice enum.
+    /// - Options map to the same Value variants.
+    /// - Function flattens to Chat's nested `{function: {name}}` wire form.
+    /// - AllowedTools preserves mode and tool list.
+    /// - Hosted / custom / apply_patch / shell / mcp have no Chat equivalent
+    ///   and fall back to `auto`.
+    #[test]
+    fn responses_tool_choice_to_chat_projection() {
+        assert!(matches!(
+            ResponsesToolChoice::Options(ToolChoiceOptions::None).to_chat_tool_choice(),
+            ChatToolChoice::Value(ChatToolChoiceValue::None)
+        ));
+        assert!(matches!(
+            ResponsesToolChoice::Options(ToolChoiceOptions::Auto).to_chat_tool_choice(),
+            ChatToolChoice::Value(ChatToolChoiceValue::Auto)
+        ));
+        assert!(matches!(
+            ResponsesToolChoice::Options(ToolChoiceOptions::Required).to_chat_tool_choice(),
+            ChatToolChoice::Value(ChatToolChoiceValue::Required)
+        ));
+
+        let fn_choice = ResponsesToolChoice::Function(ResponsesFunctionToolChoice {
+            tool_type: FunctionToolChoiceTag::Function,
+            name: "get_weather".to_string(),
+        });
+        match fn_choice.to_chat_tool_choice() {
+            ChatToolChoice::Function {
+                tool_type,
+                function,
+            } => {
+                assert_eq!(tool_type, "function");
+                assert_eq!(function.name, "get_weather");
+            }
+            other => panic!("expected Function, got {other:?}"),
+        }
+
+        let allowed = ResponsesToolChoice::AllowedTools {
+            tool_type: AllowedToolsToolChoiceTag::AllowedTools,
+            mode: "auto".to_string(),
+            tools: vec![ToolReference::Function {
+                name: "get_weather".to_string(),
+            }],
+        };
+        match allowed.to_chat_tool_choice() {
+            ChatToolChoice::AllowedTools {
+                tool_type,
+                mode,
+                tools,
+            } => {
+                assert_eq!(tool_type, "allowed_tools");
+                assert_eq!(mode, "auto");
+                assert_eq!(tools.len(), 1);
+            }
+            other => panic!("expected AllowedTools, got {other:?}"),
+        }
+
+        // Responses-only variants collapse onto Chat's `auto` — there is no
+        // spec-valid Chat projection for hosted / mcp / custom / apply_patch / shell.
+        for variant in [
+            ResponsesToolChoice::Types {
+                tool_type: BuiltInToolChoiceType::FileSearch,
+            },
+            ResponsesToolChoice::Mcp {
+                tool_type: McpToolChoiceTag::Mcp,
+                server_label: "s".into(),
+                name: None,
+            },
+            ResponsesToolChoice::Custom {
+                tool_type: CustomToolChoiceTag::Custom,
+                name: "c".into(),
+            },
+            ResponsesToolChoice::ApplyPatch {
+                tool_type: ApplyPatchToolChoiceTag::ApplyPatch,
+            },
+            ResponsesToolChoice::Shell {
+                tool_type: ShellToolChoiceTag::Shell,
+            },
+        ] {
+            assert!(matches!(
+                variant.to_chat_tool_choice(),
+                ChatToolChoice::Value(ChatToolChoiceValue::Auto)
+            ));
+        }
+    }
+
+    /// The Default impl is `Options(Auto)`.
+    #[test]
+    fn responses_tool_choice_default_is_auto() {
+        assert!(matches!(
+            ResponsesToolChoice::default(),
+            ResponsesToolChoice::Options(ToolChoiceOptions::Auto)
+        ));
     }
 }
